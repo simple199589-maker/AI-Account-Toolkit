@@ -570,6 +570,167 @@ class MultiMailRouter:
             self._failures[provider_name] = self._failures.get(provider_name, 0) + 1
 
 
+# ==================== FreeMail ====================
+
+class FreeMailProvider(MailProvider):
+    def __init__(self, api_base: str, api_key: str):
+        self.api_base = api_base.rstrip("/")
+        self.api_key = api_key
+
+    def _headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def _get_domains(self, session: _requests.Session) -> List[str]:
+        try:
+            resp = session.get(f"{self.api_base}/api/domains", headers=self._headers(), timeout=15, verify=False)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return []
+
+    def create_mailbox(
+        self,
+        proxy: str = "",
+        proxy_selector: Optional[Callable[[], str]] = None,
+    ) -> Tuple[str, str]:
+        session = _build_session(proxy, proxy_selector)
+        domains = self._get_domains(session)
+        if not domains:
+            return "", ""
+        
+        # 使用 /api/generate 随机生成
+        try:
+            resp = session.get(f"{self.api_base}/api/generate", headers=self._headers(), timeout=15, verify=False)
+            if resp.status_code == 200:
+                data = resp.json()
+                email = data.get("email")
+                if email:
+                    return email, self.api_key
+        except Exception:
+            pass
+        return "", ""
+
+    def wait_for_otp(
+        self,
+        auth_credential: str,
+        email: str,
+        proxy: str = "",
+        proxy_selector: Optional[Callable[[], str]] = None,
+        timeout: int = 120,
+        stop_event: Optional[threading.Event] = None,
+    ) -> str:
+        session = _build_session(proxy, proxy_selector)
+        start = time.time()
+        seen_ids: set = set()
+
+        while time.time() - start < timeout:
+            if stop_event and stop_event.is_set():
+                return ""
+            try:
+                # 获取邮件列表
+                resp = session.get(
+                    f"{self.api_base}/api/emails",
+                    params={"mailbox": email, "limit": 20},
+                    headers=self._headers(),
+                    timeout=15, verify=False,
+                )
+                if resp.status_code == 200:
+                    messages = resp.json()
+                    for msg in messages:
+                        msg_id = msg.get("id")
+                        if not msg_id or msg_id in seen_ids:
+                            continue
+                        seen_ids.add(msg_id)
+
+                        # 获取邮件详情以获取完整内容
+                        detail_resp = session.get(
+                            f"{self.api_base}/api/email/{msg_id}",
+                            headers=self._headers(),
+                            timeout=15, verify=False,
+                        )
+                        if detail_resp.status_code == 200:
+                            detail = detail_resp.json()
+                            sender = str(detail.get("sender") or "").lower()
+                            subject = str(detail.get("subject") or "")
+                            content = detail.get("content") or detail.get("html_content") or ""
+                            
+                            combined = f"{subject}\n{content}"
+                            if "openai" in sender or "openai" in combined.lower():
+                                code = _extract_code(combined)
+                                if code:
+                                    return code
+            except Exception:
+                pass
+            time.sleep(3)
+        return ""
+
+
+# ==================== 多提供商路由 ====================
+
+
+class MultiMailRouter:
+    """线程安全的多邮箱提供商路由器，支持轮询/随机/容错策略"""
+
+    def __init__(self, config: Dict[str, Any]):
+        providers_list: List[str] = config.get("mail_providers") or []
+        provider_configs: Dict[str, Dict] = config.get("mail_provider_configs") or {}
+        self.strategy: str = config.get("mail_strategy", "round_robin")
+
+        if not providers_list:
+            legacy = config.get("mail_provider", "mailtm")
+            providers_list = [legacy]
+            provider_configs = {legacy: config.get("mail_config") or {}}
+
+        self._provider_names: List[str] = []
+        self._providers: Dict[str, MailProvider] = {}
+        self._failures: Dict[str, int] = {}
+        self._lock = threading.RLock()
+        self._counter = itertools.count()
+
+        for name in providers_list:
+            try:
+                p = create_provider_by_name(name, provider_configs.get(name, {}))
+                self._provider_names.append(name)
+                self._providers[name] = p
+                self._failures[name] = 0
+            except Exception as e:
+                logger.warning("创建邮箱提供商 %s 失败: %s", name, e)
+
+        if not self._providers:
+            fallback = create_provider_by_name("mailtm", {})
+            self._provider_names = ["mailtm"]
+            self._providers = {"mailtm": fallback}
+            self._failures = {"mailtm": 0}
+
+    def next_provider(self) -> Tuple[str, MailProvider]:
+        with self._lock:
+            names = self._provider_names
+            if not names:
+                raise RuntimeError("无可用邮箱提供商")
+
+            if self.strategy == "random":
+                name = random.choice(names)
+            elif self.strategy == "failover":
+                name = min(names, key=lambda n: self._failures.get(n, 0))
+            else:
+                idx = next(self._counter) % len(names)
+                name = names[idx]
+            return name, self._providers[name]
+
+    def providers(self) -> List[Tuple[str, MailProvider]]:
+        with self._lock:
+            return [(n, self._providers[n]) for n in self._provider_names]
+
+    def report_success(self, provider_name: str) -> None:
+        with self._lock:
+            self._failures[provider_name] = max(0, self._failures.get(provider_name, 0) - 1)
+
+    def report_failure(self, provider_name: str) -> None:
+        with self._lock:
+            self._failures[provider_name] = self._failures.get(provider_name, 0) + 1
+
+
 # ==================== 工厂函数 ====================
 
 
@@ -587,6 +748,11 @@ def create_provider_by_name(provider_type: str, mail_cfg: Dict[str, Any]) -> Mai
         return DuckMailProvider(
             api_base=api_base or "https://api.duckmail.sbs",
             bearer_token=str(mail_cfg.get("bearer_token", "")).strip(),
+        )
+    elif provider_type == "freemail":
+        return FreeMailProvider(
+            api_base=api_base,
+            api_key=str(mail_cfg.get("api_key", "")).strip(),
         )
     else:
         return MailTmProvider(api_base=api_base or "https://api.mail.tm")
