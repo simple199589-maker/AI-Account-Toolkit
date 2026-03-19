@@ -1171,6 +1171,7 @@ def run(
             "last_refresh": now_rfc3339,
             "expires_at": expired_rfc3339,
             "email": email,
+            "password": rand_password,
             "type": "codex",
             "expired": expired_rfc3339,
         }
@@ -1315,6 +1316,7 @@ def run(
         )
         # 解析 signup 响应，判断注册流程类型
         signup_page_type = ""
+        rand_password = ""  # 密码注册时会填充
         try:
             signup_data = signup_resp.json() if signup_resp.status_code == 200 else {}
             signup_page_type = (signup_data.get("page") or {}).get("type", "")
