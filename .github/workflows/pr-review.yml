@@ -181,13 +181,11 @@ jobs:
     name: 🤖 AI 代码审查
     runs-on: ubuntu-latest
     needs: [security-check, auto-check]
-    # fork PR 没有 secrets，需要跳过或手动触发
     if: |
       needs.security-check.outputs.safe_to_run == 'true' &&
       needs.auto-check.result == 'success' &&
       needs.auto-check.outputs.has_reviewable_changes == 'true' &&
-      vars.ENABLE_AI_REVIEW != 'false' &&
-      secrets.OPENAI_API_KEY != ''
+      vars.ENABLE_AI_REVIEW != 'false'
     
     steps:
       # 先检出主分支（获取最新的 .github/scripts）
