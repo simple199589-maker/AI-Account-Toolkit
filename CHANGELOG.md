@@ -44,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 项目结构优化，整合多个注册工具
 - 根目录 README 添加新子项目导航
 
-## [1.0.0] - 2025-xx-xx
+## [1.0.0] - 2025-02-18
 
 ### Added
 
