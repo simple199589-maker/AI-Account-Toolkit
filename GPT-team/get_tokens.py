@@ -21,6 +21,7 @@ import re
 import secrets
 import string
 import sys
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,6 +48,15 @@ def _load_config() -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+def _as_bool(value: Any) -> bool:
+    """将配置值规范化为布尔值。AI by zb"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 _cfg = _load_config()
 
 TOTAL_ACCOUNTS: int = int(_cfg.get("total_accounts", 1))
@@ -54,6 +64,78 @@ TEMP_MAIL_WORKER_DOMAIN: str = _cfg["temp_mail"]["worker_domain"]
 TEMP_MAIL_EMAIL_DOMAINS: List[str] = _cfg["temp_mail"]["email_domains"]
 TEMP_MAIL_ADMIN_PASSWORD: str = _cfg["temp_mail"]["admin_password"]
 RESULTS_FILE: str = _cfg.get("output", {}).get("results_file", "results.txt")
+_sub2api_cfg: Dict[str, Any] = _cfg.get("sub2api", {}) or {}
+SUB2API_BASE_URL: str = str(_sub2api_cfg.get("base_url", "") or "").strip().rstrip("/")
+SUB2API_BEARER: str = str(_sub2api_cfg.get("bearer", "") or "").strip()
+SUB2API_EMAIL: str = str(_sub2api_cfg.get("email", "") or "").strip()
+SUB2API_PASSWORD: str = str(_sub2api_cfg.get("password", "") or "").strip()
+AUTO_UPLOAD_SUB2API: bool = _as_bool(_sub2api_cfg.get("auto_upload_sub2api", False))
+_raw_group_ids = _sub2api_cfg.get("group_ids", [2])
+if isinstance(_raw_group_ids, list):
+    SUB2API_GROUP_IDS: List[int] = [
+        int(x) for x in _raw_group_ids if str(x).strip().lstrip("-").isdigit()
+    ]
+elif str(_raw_group_ids).strip().lstrip("-").isdigit():
+    SUB2API_GROUP_IDS = [int(_raw_group_ids)]
+else:
+    SUB2API_GROUP_IDS = [2]
+
+SUB2API_MODEL_MAPPING: Dict[str, str] = {
+    "gpt-3.5-turbo": "gpt-3.5-turbo",
+    "gpt-3.5-turbo-0125": "gpt-3.5-turbo-0125",
+    "gpt-3.5-turbo-1106": "gpt-3.5-turbo-1106",
+    "gpt-3.5-turbo-16k": "gpt-3.5-turbo-16k",
+    "gpt-4": "gpt-4",
+    "gpt-4-turbo": "gpt-4-turbo",
+    "gpt-4-turbo-preview": "gpt-4-turbo-preview",
+    "gpt-4o": "gpt-4o",
+    "gpt-4o-2024-08-06": "gpt-4o-2024-08-06",
+    "gpt-4o-2024-11-20": "gpt-4o-2024-11-20",
+    "gpt-4o-mini": "gpt-4o-mini",
+    "gpt-4o-mini-2024-07-18": "gpt-4o-mini-2024-07-18",
+    "gpt-4.5-preview": "gpt-4.5-preview",
+    "gpt-4.1": "gpt-4.1",
+    "gpt-4.1-mini": "gpt-4.1-mini",
+    "gpt-4.1-nano": "gpt-4.1-nano",
+    "o1": "o1",
+    "o1-preview": "o1-preview",
+    "o1-mini": "o1-mini",
+    "o1-pro": "o1-pro",
+    "o3": "o3",
+    "o3-mini": "o3-mini",
+    "o3-pro": "o3-pro",
+    "o4-mini": "o4-mini",
+    "gpt-5": "gpt-5",
+    "gpt-5-2025-08-07": "gpt-5-2025-08-07",
+    "gpt-5-chat": "gpt-5-chat",
+    "gpt-5-chat-latest": "gpt-5-chat-latest",
+    "gpt-5-codex": "gpt-5-codex",
+    "gpt-5.3-codex-spark": "gpt-5.3-codex-spark",
+    "gpt-5-pro": "gpt-5-pro",
+    "gpt-5-pro-2025-10-06": "gpt-5-pro-2025-10-06",
+    "gpt-5-mini": "gpt-5-mini",
+    "gpt-5-mini-2025-08-07": "gpt-5-mini-2025-08-07",
+    "gpt-5-nano": "gpt-5-nano",
+    "gpt-5-nano-2025-08-07": "gpt-5-nano-2025-08-07",
+    "gpt-5.1": "gpt-5.1",
+    "gpt-5.1-2025-11-13": "gpt-5.1-2025-11-13",
+    "gpt-5.1-chat-latest": "gpt-5.1-chat-latest",
+    "gpt-5.1-codex": "gpt-5.1-codex",
+    "gpt-5.1-codex-max": "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini": "gpt-5.1-codex-mini",
+    "gpt-5.2": "gpt-5.2",
+    "gpt-5.2-2025-12-11": "gpt-5.2-2025-12-11",
+    "gpt-5.2-chat-latest": "gpt-5.2-chat-latest",
+    "gpt-5.2-codex": "gpt-5.2-codex",
+    "gpt-5.2-pro": "gpt-5.2-pro",
+    "gpt-5.2-pro-2025-12-11": "gpt-5.2-pro-2025-12-11",
+    "gpt-5.4": "gpt-5.4",
+    "gpt-5.4-2026-03-05": "gpt-5.4-2026-03-05",
+    "gpt-5.3-codex": "gpt-5.3-codex",
+    "chatgpt-4o-latest": "chatgpt-4o-latest",
+    "gpt-4o-audio-preview": "gpt-4o-audio-preview",
+    "gpt-4o-realtime-preview": "gpt-4o-realtime-preview",
+}
 
 # OAuth 常量
 OPENAI_AUTH_BASE = "https://auth.openai.com"
@@ -72,6 +154,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("get-tokens")
+_save_lock = threading.Lock()
+_sub2api_auth_lock = threading.Lock()
+_sub2api_bearer_holder = [SUB2API_BEARER]
 
 # ============================================================
 # HTTP 工具
@@ -603,10 +688,176 @@ def _follow_redirects_for_code(
     return None
 
 
-def oauth_login(email: str, password: str, jwt_token: str, proxy: str = "") -> Optional[str]:
+def _decode_jwt_payload(token: str) -> Dict[str, Any]:
+    """解码 JWT payload，不校验签名。AI by zb"""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        payload = parts[1]
+        padding = 4 - len(payload) % 4
+        if padding != 4:
+            payload += "=" * padding
+        decoded = base64.urlsafe_b64decode(payload)
+        data = json.loads(decoded)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _sub2api_login() -> str:
+    """登录 Sub2Api 并返回 bearer token。AI by zb"""
+    if not SUB2API_BASE_URL or not SUB2API_EMAIL or not SUB2API_PASSWORD:
+        return ""
+    try:
+        resp = http_session.post(
+            f"{SUB2API_BASE_URL}/api/v1/auth/login",
+            json={"email": SUB2API_EMAIL, "password": SUB2API_PASSWORD},
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=15,
+            verify=False,
+        )
+        data = resp.json()
+        token = (
+            data.get("token")
+            or data.get("access_token")
+            or (data.get("data") or {}).get("token")
+            or (data.get("data") or {}).get("access_token")
+            or ""
+        )
+        return str(token).strip()
+    except Exception as e:
+        logger.warning("[Sub2Api] 登录失败: %s", e)
+        return ""
+
+
+def _build_sub2api_account_payload(email: str, tokens: Dict[str, Any]) -> Dict[str, Any]:
+    """构建与参考脚本完全对齐的 Sub2Api 上传 payload。AI by zb"""
+    access_token = str(tokens.get("access_token") or "")
+    refresh_token = str(tokens.get("refresh_token") or "")
+    id_token = str(tokens.get("id_token") or "")
+
+    at_payload = _decode_jwt_payload(access_token) if access_token else {}
+    at_auth = at_payload.get("https://api.openai.com/auth") or {}
+    chatgpt_account_id = at_auth.get("chatgpt_account_id", "") or tokens.get("account_id", "")
+    chatgpt_user_id = at_auth.get("chatgpt_user_id", "")
+    exp_timestamp = at_payload.get("exp", 0)
+    expires_at = exp_timestamp if isinstance(exp_timestamp, int) and exp_timestamp > 0 else int(time.time()) + 863999
+
+    it_payload = _decode_jwt_payload(id_token) if id_token else {}
+    it_auth = it_payload.get("https://api.openai.com/auth") or {}
+    organization_id = it_auth.get("organization_id", "")
+    if not organization_id:
+        orgs = it_auth.get("organizations") or []
+        if orgs:
+            organization_id = (orgs[0] or {}).get("id", "")
+
+    return {
+        "auto_pause_on_expired": True,
+        "concurrency": 10,
+        "credentials": {
+            "access_token": access_token,
+            "chatgpt_account_id": chatgpt_account_id,
+            "chatgpt_user_id": chatgpt_user_id,
+            "client_id": OAUTH_CLIENT_ID,
+            "expires_in": 863999,
+            "expires_at": expires_at,
+            "model_mapping": SUB2API_MODEL_MAPPING,
+            "organization_id": organization_id,
+            "refresh_token": refresh_token,
+        },
+        "extra": {
+            "email": email,
+            "openai_oauth_responses_websockets_v2_enabled": True,
+            "openai_oauth_responses_websockets_v2_mode": "off",
+        },
+        "group_ids": SUB2API_GROUP_IDS,
+        "name": email,
+        "notes": "",
+        "platform": "openai",
+        "priority": 1,
+        "type": "oauth",
+        "rate_multiplier": 1,
+    }
+
+
+def _push_account_to_sub2api(email: str, tokens: Dict[str, Any]) -> bool:
+    """上传账号到 Sub2Api，401 时自动刷新 bearer 后重试。AI by zb"""
+    if not SUB2API_BASE_URL or not str(tokens.get("refresh_token") or "").strip():
+        return False
+
+    url = f"{SUB2API_BASE_URL}/api/v1/admin/accounts"
+    payload = _build_sub2api_account_payload(email, tokens)
+
+    def _do_request(bearer: str) -> Tuple[int, str]:
+        try:
+            resp = http_session.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {bearer}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/plain, */*",
+                    "Referer": f"{SUB2API_BASE_URL}/admin/accounts",
+                },
+                timeout=20,
+                verify=False,
+            )
+            return resp.status_code, resp.text
+        except Exception as e:
+            return 0, str(e)
+
+    bearer = _sub2api_bearer_holder[0]
+    status, body = _do_request(bearer)
+
+    if status == 401 and SUB2API_EMAIL and SUB2API_PASSWORD:
+        with _sub2api_auth_lock:
+            if _sub2api_bearer_holder[0] == bearer:
+                new_token = _sub2api_login()
+                if new_token:
+                    _sub2api_bearer_holder[0] = new_token
+        bearer = _sub2api_bearer_holder[0]
+        status, body = _do_request(bearer)
+
+    ok = status in (200, 201)
+    if ok:
+        logger.info("[Sub2Api] 上传成功: %s | HTTP %s", email, status)
+    else:
+        logger.warning("[Sub2Api] 上传失败: %s | HTTP %s | %s", email, status, body[:500])
+    return ok
+
+
+def _exchange_code_for_token(code: str, code_verifier: str, proxy: str = "") -> Optional[Dict[str, Any]]:
+    """用 authorization_code 交换完整 token 响应。AI by zb"""
+    logger.info("[登录] Step F: code 换 token")
+    try:
+        resp_tok = create_session(proxy=proxy).post(
+            f"{OPENAI_AUTH_BASE}/oauth/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": OAUTH_REDIRECT_URI,
+                "client_id": OAUTH_CLIENT_ID,
+                "code_verifier": code_verifier,
+            },
+            verify=False,
+            timeout=60,
+        )
+        if resp_tok.status_code == 200:
+            data = resp_tok.json()
+            return data if isinstance(data, dict) else None
+        logger.warning("[登录] token 交换失败: HTTP %s", resp_tok.status_code)
+    except Exception as e:
+        logger.warning("[登录] token 交换异常: %s", e)
+    return None
+
+
+def oauth_login_tokens(
+    email: str, password: str, jwt_token: str, proxy: str = ""
+) -> Optional[Dict[str, Any]]:
     """
-    HTTP OAuth 登录，返回 access_token 字符串，失败返回 None。
-    流程：A.获取login_session → B.提交邮箱 → C.提交密码 → D.OTP(可选) → E.获取code → F.换token
+    HTTP OAuth 登录，返回完整 token 字典，失败返回 None。AI by zb
     """
     session = create_session(proxy=proxy)
     device_id = str(uuid.uuid4())
@@ -966,39 +1217,23 @@ def oauth_login(email: str, password: str, jwt_token: str, proxy: str = "") -> O
         logger.warning("[登录] 未能获取 auth_code")
         return None
 
-    # Step F: code 换 token
-    logger.info("[登录] Step F: code 换 token")
-    try:
-        resp_tok = create_session(proxy=proxy).post(
-            f"{OPENAI_AUTH_BASE}/oauth/token",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data={
-                "grant_type": "authorization_code",
-                "code": auth_code,
-                "redirect_uri": OAUTH_REDIRECT_URI,
-                "client_id": OAUTH_CLIENT_ID,
-                "code_verifier": code_verifier,
-            },
-            verify=False, timeout=60,
-        )
-        if resp_tok.status_code == 200:
-            data = resp_tok.json()
-            access_token = str(data.get("access_token") or "")
-            if access_token:
-                logger.info("[登录] access_token 获取成功")
-                return access_token
-        logger.warning("[登录] token 交换失败: HTTP %s", resp_tok.status_code)
-    except Exception as e:
-        logger.warning("[登录] token 交换异常: %s", e)
+    tokens = _exchange_code_for_token(auth_code, code_verifier, proxy=proxy)
+    if tokens and str(tokens.get("access_token") or "").strip():
+        logger.info("[登录] access_token 获取成功")
+        return tokens
     return None
+
+
+def oauth_login(email: str, password: str, jwt_token: str, proxy: str = "") -> Optional[str]:
+    """兼容旧接口，仅返回 access_token。AI by zb"""
+    tokens = oauth_login_tokens(email=email, password=password, jwt_token=jwt_token, proxy=proxy)
+    access_token = str((tokens or {}).get("access_token") or "").strip()
+    return access_token or None
 
 
 # ============================================================
 # 结果保存
 # ============================================================
-
-_save_lock = __import__("threading").Lock()
-
 
 def save_result(email: str, email_jwt: str, password: str, access_token: str) -> None:
     """追加保存一行到 results.txt"""
@@ -1038,12 +1273,14 @@ def process_one(proxy: str = "") -> bool:
     logger.info("注册成功: %s", email)
     time.sleep(3)
 
-    # 3. 登录获取 access_token（最多重试 3 次）
-    access_token: Optional[str] = None
+    # 3. 登录获取完整 token（最多重试 3 次）
+    tokens: Optional[Dict[str, Any]] = None
+    access_token = ""
     for attempt in range(1, 4):
-        access_token = oauth_login(
+        tokens = oauth_login_tokens(
             email=email, password=password, jwt_token=email_jwt, proxy=proxy
         )
+        access_token = str((tokens or {}).get("access_token") or "").strip()
         if access_token:
             break
         if attempt < 3:
@@ -1058,6 +1295,8 @@ def process_one(proxy: str = "") -> bool:
 
     # 4. 保存
     save_result(email, email_jwt or "", password, access_token)
+    if AUTO_UPLOAD_SUB2API and SUB2API_BASE_URL and str((tokens or {}).get("refresh_token") or "").strip():
+        _push_account_to_sub2api(email, tokens or {})
     logger.info("完成: %s", email)
     return True
 
