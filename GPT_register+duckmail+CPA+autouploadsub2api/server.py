@@ -547,7 +547,10 @@ async def start_task(req: StartRequest):
             raise HTTPException(status_code=400, detail="任务已在运行")
     run_id = uuid.uuid4().hex[:12]
     cfg = _load_config()
-    proxy = str(cfg.get("proxy", "") or cfg.get("stable_proxy", "") or "").strip() or None
+    proxy_enabled = str(cfg.get("proxy_enabled", True)).strip().lower() in ("1", "true", "yes", "y", "on")
+    proxy = None
+    if proxy_enabled:
+        proxy = str(cfg.get("stable_proxy", "") or cfg.get("proxy", "") or "").strip() or None
     output_file = str(BASE_DIR / "registered_accounts.txt")
 
     _set_task(

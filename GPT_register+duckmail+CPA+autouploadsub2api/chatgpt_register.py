@@ -1,7 +1,7 @@
 """
-ChatGPT 批量自动注册工具 (并发版) - DuckMail 临时邮箱版
+ChatGPT 批量自动注册工具 (并发版) - 邮件 API 版
 依赖: pip install curl_cffi
-功能: 使用 DuckMail 临时邮箱，并发自动注册 ChatGPT 账号，自动获取 OTP 验证码
+功能: 使用邮件 API 创建邮箱，并发自动注册 ChatGPT 账号，自动获取 OTP 验证码
 """
 
 import os
@@ -17,6 +17,7 @@ import traceback
 import secrets
 import hashlib
 import base64
+from datetime import datetime, timezone
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,7 +32,10 @@ def _load_config():
         "total_accounts": 3,
         "duckmail_api_base": "https://api.duckmail.sbs",
         "duckmail_bearer": "",
+        "duckmail_use_proxy": True,
+        "proxy_enabled": True,
         "proxy": "",
+        "proxy_list_enabled": True,
         "proxy_list_url": "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/US/data.txt",
         "proxy_validate_enabled": True,
         "proxy_validate_timeout_seconds": 6,
@@ -72,7 +76,10 @@ def _load_config():
     # 环境变量优先级更高
     config["duckmail_api_base"] = os.environ.get("DUCKMAIL_API_BASE", config["duckmail_api_base"])
     config["duckmail_bearer"] = os.environ.get("DUCKMAIL_BEARER", config["duckmail_bearer"])
+    config["duckmail_use_proxy"] = os.environ.get("DUCKMAIL_USE_PROXY", config["duckmail_use_proxy"])
+    config["proxy_enabled"] = os.environ.get("PROXY_ENABLED", config["proxy_enabled"])
     config["proxy"] = os.environ.get("PROXY", config["proxy"])
+    config["proxy_list_enabled"] = os.environ.get("PROXY_LIST_ENABLED", config["proxy_list_enabled"])
     config["proxy_list_url"] = os.environ.get("PROXY_LIST_URL", config["proxy_list_url"])
     config["proxy_validate_enabled"] = os.environ.get("PROXY_VALIDATE_ENABLED", config["proxy_validate_enabled"])
     config["proxy_validate_timeout_seconds"] = float(os.environ.get(
@@ -125,8 +132,11 @@ def _as_bool(value):
 _CONFIG = _load_config()
 DUCKMAIL_API_BASE = _CONFIG["duckmail_api_base"]
 DUCKMAIL_BEARER = _CONFIG["duckmail_bearer"]
+DUCKMAIL_USE_PROXY = _as_bool(_CONFIG.get("duckmail_use_proxy", True))
 DEFAULT_TOTAL_ACCOUNTS = _CONFIG["total_accounts"]
+PROXY_ENABLED = _as_bool(_CONFIG.get("proxy_enabled", True))
 DEFAULT_PROXY = _CONFIG["proxy"]
+PROXY_LIST_ENABLED = _as_bool(_CONFIG.get("proxy_list_enabled", True))
 PROXY_LIST_URL = _CONFIG["proxy_list_url"]
 PROXY_VALIDATE_ENABLED = _as_bool(_CONFIG.get("proxy_validate_enabled", True))
 PROXY_VALIDATE_TIMEOUT_SECONDS = max(1.0, float(_CONFIG.get("proxy_validate_timeout_seconds", 6)))
@@ -142,7 +152,7 @@ DEFAULT_OUTPUT_FILE = _CONFIG["output_file"]
 ENABLE_OAUTH = _as_bool(_CONFIG.get("enable_oauth", True))
 OAUTH_REQUIRED = _as_bool(_CONFIG.get("oauth_required", True))
 OAUTH_ISSUER = _CONFIG["oauth_issuer"].rstrip("/")
-OAUTH_CLIENT_ID = _CONFIG["oauth_client_id"]
+OAUTH_CLIENT_ID = str(_CONFIG.get("oauth_client_id", "") or "").strip() or "app_EMoamEEZ73f0CkXaXp7hrann"
 OAUTH_REDIRECT_URI = _CONFIG["oauth_redirect_uri"]
 AK_FILE = _CONFIG["ak_file"]
 RK_FILE = _CONFIG["rk_file"]
@@ -160,9 +170,9 @@ _sub2api_bearer_holder = [SUB2API_BEARER]
 _sub2api_auth_lock = threading.Lock()
 
 if not DUCKMAIL_BEARER:
-    print("⚠️ 警告: 未设置 DUCKMAIL_BEARER，请在 config.json 中设置或设置环境变量")
+    print("⚠️ 警告: 未设置 duckmail_bearer(JWT_TOKEN)，请在 config.json 中设置或设置环境变量")
     print("   文件: config.json -> duckmail_bearer")
-    print("   环境变量: export DUCKMAIL_BEARER='your_api_key_here'")
+    print("   环境变量: export DUCKMAIL_BEARER='your_jwt_token'")
 
 # 全局线程锁
 _print_lock = threading.Lock()
@@ -204,9 +214,10 @@ class ProxyPool:
                  max_retries_per_request: int = 30, bad_ttl_seconds: int = 180,
                  validate_enabled: bool = True, validate_timeout_seconds: float = 6,
                  validate_workers: int = 40, validate_test_url: str = "https://auth.openai.com/",
-                 prefer_stable_proxy: bool = True):
+                 prefer_stable_proxy: bool = True, list_enabled: bool = True):
         self.list_url = _normalize_proxy_list_url(list_url)
         self.fallback_proxy = _normalize_proxy(fallback_proxy)
+        self.list_enabled = bool(list_enabled)
         self.max_retries_per_request = max(1, int(max_retries_per_request))
         self.bad_ttl_seconds = max(10, int(bad_ttl_seconds))
         self.validate_enabled = bool(validate_enabled)
@@ -241,6 +252,15 @@ class ProxyPool:
     def set_prefer_stable_proxy(self, enabled: bool):
         with self._lock:
             self.prefer_stable_proxy = bool(enabled)
+
+    def set_list_enabled(self, enabled: bool):
+        """切换是否使用代理列表。AI by zb"""
+        with self._lock:
+            enabled = bool(enabled)
+            if self.list_enabled == enabled:
+                return
+            self.list_enabled = enabled
+            self._loaded = False
 
     def get_stable_proxy(self):
         with self._lock:
@@ -325,17 +345,28 @@ class ProxyPool:
         with self._lock:
             if self._loaded and not force:
                 return
+            list_enabled = self.list_enabled
+            stable_proxy = self._stable_proxy
+            fallback_proxy = self.fallback_proxy
 
         proxies = []
         fetched_proxies = []
         last_error = ""
-        try:
-            fetched_proxies = self._fetch_proxies()
-            proxies = self._filter_valid_proxies(fetched_proxies)
-            if self.validate_enabled and fetched_proxies and not proxies:
-                last_error = "代理校验后无可用代理"
-        except Exception as e:
-            last_error = str(e)
+        if list_enabled:
+            try:
+                fetched_proxies = self._fetch_proxies()
+                proxies = self._filter_valid_proxies(fetched_proxies)
+                if self.validate_enabled and fetched_proxies and not proxies:
+                    last_error = "代理校验后无可用代理"
+            except Exception as e:
+                last_error = str(e)
+        else:
+            seen = set()
+            for proxy in (stable_proxy, fallback_proxy):
+                normalized = _normalize_proxy(proxy)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    proxies.append(normalized)
 
         with self._lock:
             self._last_fetched_count = len(fetched_proxies)
@@ -437,6 +468,7 @@ class ProxyPool:
                     bad_count += 1
             return {
                 "list_url": self.list_url,
+                "list_enabled": self.list_enabled,
                 "count": len(self._proxies),
                 "fetched_count": self._last_fetched_count,
                 "validated_count": self._last_valid_count,
@@ -464,6 +496,7 @@ _proxy_pool = ProxyPool(
     validate_workers=PROXY_VALIDATE_WORKERS,
     validate_test_url=PROXY_VALIDATE_TEST_URL,
     prefer_stable_proxy=PREFER_STABLE_PROXY,
+    list_enabled=PROXY_LIST_ENABLED,
 )
 _stable_proxy_loaded = False
 
@@ -471,6 +504,7 @@ _stable_proxy_loaded = False
 def _get_proxy_pool(fallback_proxy=None):
     global _stable_proxy_loaded
     _proxy_pool.set_prefer_stable_proxy(PREFER_STABLE_PROXY)
+    _proxy_pool.set_list_enabled(PROXY_LIST_ENABLED)
     if not _stable_proxy_loaded:
         stable = STABLE_PROXY or _load_stable_proxy_from_file()
         if stable:
@@ -505,6 +539,9 @@ def _is_proxy_related_error(exc: Exception):
 
 
 def _enable_proxy_rotation(session, fallback_proxy=None, fixed_proxy=None):
+    if not PROXY_ENABLED:
+        session.trust_env = False
+        return session
     pool = _get_proxy_pool(fallback_proxy)
     fixed_proxy = _normalize_proxy(fixed_proxy)
     original_request = session.request
@@ -968,24 +1005,31 @@ def _build_sub2api_account_payload(email: str, tokens: dict) -> dict:
             organization_id = (orgs[0] or {}).get("id", "")
 
     return {
+        "auto_pause_on_expired": True,
+        "concurrency": 10,
+        "credentials": {
+            "access_token": access_token,
+            "chatgpt_account_id": chatgpt_account_id,
+            "chatgpt_user_id": chatgpt_user_id,
+            "client_id": OAUTH_CLIENT_ID,
+            "expires_in": 863999,
+            "expires_at": expires_at,
+            "model_mapping": {"gpt-3.5-turbo":"gpt-3.5-turbo","gpt-3.5-turbo-0125":"gpt-3.5-turbo-0125","gpt-3.5-turbo-1106":"gpt-3.5-turbo-1106","gpt-3.5-turbo-16k":"gpt-3.5-turbo-16k","gpt-4":"gpt-4","gpt-4-turbo":"gpt-4-turbo","gpt-4-turbo-preview":"gpt-4-turbo-preview","gpt-4o":"gpt-4o","gpt-4o-2024-08-06":"gpt-4o-2024-08-06","gpt-4o-2024-11-20":"gpt-4o-2024-11-20","gpt-4o-mini":"gpt-4o-mini","gpt-4o-mini-2024-07-18":"gpt-4o-mini-2024-07-18","gpt-4.5-preview":"gpt-4.5-preview","gpt-4.1":"gpt-4.1","gpt-4.1-mini":"gpt-4.1-mini","gpt-4.1-nano":"gpt-4.1-nano","o1":"o1","o1-preview":"o1-preview","o1-mini":"o1-mini","o1-pro":"o1-pro","o3":"o3","o3-mini":"o3-mini","o3-pro":"o3-pro","o4-mini":"o4-mini","gpt-5":"gpt-5","gpt-5-2025-08-07":"gpt-5-2025-08-07","gpt-5-chat":"gpt-5-chat","gpt-5-chat-latest":"gpt-5-chat-latest","gpt-5-codex":"gpt-5-codex","gpt-5.3-codex-spark":"gpt-5.3-codex-spark","gpt-5-pro":"gpt-5-pro","gpt-5-pro-2025-10-06":"gpt-5-pro-2025-10-06","gpt-5-mini":"gpt-5-mini","gpt-5-mini-2025-08-07":"gpt-5-mini-2025-08-07","gpt-5-nano":"gpt-5-nano","gpt-5-nano-2025-08-07":"gpt-5-nano-2025-08-07","gpt-5.1":"gpt-5.1","gpt-5.1-2025-11-13":"gpt-5.1-2025-11-13","gpt-5.1-chat-latest":"gpt-5.1-chat-latest","gpt-5.1-codex":"gpt-5.1-codex","gpt-5.1-codex-max":"gpt-5.1-codex-max","gpt-5.1-codex-mini":"gpt-5.1-codex-mini","gpt-5.2":"gpt-5.2","gpt-5.2-2025-12-11":"gpt-5.2-2025-12-11","gpt-5.2-chat-latest":"gpt-5.2-chat-latest","gpt-5.2-codex":"gpt-5.2-codex","gpt-5.2-pro":"gpt-5.2-pro","gpt-5.2-pro-2025-12-11":"gpt-5.2-pro-2025-12-11","gpt-5.4":"gpt-5.4","gpt-5.4-2026-03-05":"gpt-5.4-2026-03-05","gpt-5.3-codex":"gpt-5.3-codex","chatgpt-4o-latest":"chatgpt-4o-latest","gpt-4o-audio-preview":"gpt-4o-audio-preview","gpt-4o-realtime-preview":"gpt-4o-realtime-preview"},
+            "organization_id": organization_id,
+            "refresh_token": refresh_token,
+        },
+        "extra": {
+            "email": email,
+            "openai_oauth_responses_websockets_v2_enabled": True,
+            "openai_oauth_responses_websockets_v2_mode": "off"
+        },
+        "group_ids": SUB2API_GROUP_IDS,
         "name": email,
         "notes": "",
         "platform": "openai",
-        "type": "oauth",
-        "credentials": {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "expires_in": 863999,
-            "expires_at": expires_at,
-            "chatgpt_account_id": chatgpt_account_id,
-            "chatgpt_user_id": chatgpt_user_id,
-            "organization_id": organization_id,
-        },
-        "extra": {"email": email},
-        "group_ids": SUB2API_GROUP_IDS,
-        "concurrency": 10,
         "priority": 1,
-        "auto_pause_on_expired": True,
+        "type": "oauth",
+        "rate_multiplier": 1,
     }
 
 
@@ -1054,109 +1098,197 @@ def _generate_password(length=14):
     return "".join(pwd)
 
 
-# ================= DuckMail 邮箱函数 =================
+# ================= 邮件 API 函数 =================
 
-def _create_duckmail_session():
-    """创建带重试的 DuckMail 请求会话"""
+def _create_mail_api_session():
+    """创建带重试的邮件 API 请求会话"""
     session = curl_requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json",
         "Content-Type": "application/json",
     })
-    return _enable_proxy_rotation(session)
+    if DUCKMAIL_USE_PROXY:
+        return _enable_proxy_rotation(session)
+    session.trust_env = False
+    return session
+
+
+def _mail_api_url(path: str):
+    """构造邮件 API 完整地址。AI by zb"""
+    api_base = DUCKMAIL_API_BASE.rstrip("/")
+    suffix = path if path.startswith("/") else f"/{path}"
+    if api_base.endswith("/api"):
+        return f"{api_base}{suffix}"
+    return f"{api_base}/api{suffix}"
+
+
+def _mail_api_headers():
+    """构造邮件 API 认证头。AI by zb"""
+    return {
+        "Authorization": f"Bearer {DUCKMAIL_BEARER}",
+        "X-Admin-Token": DUCKMAIL_BEARER,
+    }
+
+
+def _mail_message_sort_key(message):
+    """按接收时间和 ID 生成排序键，优先最新邮件。AI by zb"""
+    raw = str(
+        message.get("received_at")
+        or message.get("created_at")
+        or message.get("date")
+        or ""
+    ).strip()
+    ts = 0.0
+    if raw:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+            try:
+                dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+                ts = dt.timestamp()
+                break
+            except Exception:
+                continue
+        if not ts:
+            for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
+                try:
+                    ts = datetime.strptime(raw, fmt).timestamp()
+                    break
+                except Exception:
+                    continue
+        if not ts:
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                ts = dt.timestamp()
+            except Exception:
+                ts = 0.0
+
+    raw_id = message.get("id") or message.get("@id") or 0
+    try:
+        msg_id = int(str(raw_id).rsplit("/", 1)[-1])
+    except Exception:
+        msg_id = 0
+    return (ts, msg_id)
+
+
+def _mail_message_identity(message):
+    """提取邮件唯一标识，优先使用邮件 ID。AI by zb"""
+    raw_id = message.get("id") or message.get("@id")
+    return str(raw_id).strip() if raw_id is not None else ""
+
+
+def _mail_message_id_set(messages):
+    """提取邮件列表中的 ID 集合。AI by zb"""
+    result = set()
+    if not isinstance(messages, list):
+        return result
+    for msg in messages:
+        identity = _mail_message_identity(msg)
+        if identity:
+            result.add(identity)
+    return result
+
+
+def _sort_mail_messages(messages):
+    """按最新优先排序邮件列表。AI by zb"""
+    if not isinstance(messages, list):
+        return []
+    return sorted(messages, key=_mail_message_sort_key, reverse=True)
+
+
+def _recent_mail_messages(messages, not_before_ts=None, slack_seconds=8, exclude_message_ids=None):
+    """筛选指定时间后的邮件，优先避免误用旧验证码。AI by zb"""
+    ordered = _sort_mail_messages(messages)
+    exclude_message_ids = set(exclude_message_ids or [])
+    if not not_before_ts and not exclude_message_ids:
+        return ordered
+
+    threshold = float(not_before_ts) - max(0, int(slack_seconds))
+    recent = []
+    for msg in ordered:
+        identity = _mail_message_identity(msg)
+        if identity and identity in exclude_message_ids:
+            continue
+        if not not_before_ts:
+            recent.append(msg)
+            continue
+        msg_ts, _ = _mail_message_sort_key(msg)
+        if msg_ts <= 0:
+            continue
+        if msg_ts >= threshold:
+            recent.append(msg)
+    return recent
 
 
 def create_temp_email():
-    """创建 DuckMail 临时邮箱，返回 (email, password, mail_token)"""
+    """创建邮件地址，返回 (email, password, mailbox_ref)"""
     if not DUCKMAIL_BEARER:
-        raise Exception("DUCKMAIL_BEARER 未设置，无法创建临时邮箱")
+        raise Exception("duckmail_bearer(JWT_TOKEN) 未设置，无法创建临时邮箱")
 
     # 生成随机邮箱前缀 8-13 位
-    chars = string.ascii_lowercase + string.digits
     length = random.randint(8, 13)
-    email_local = "".join(random.choice(chars) for _ in range(length))
-    email = f"{email_local}@duckmail.sbs"
-    password = _generate_password()
-
-    api_base = DUCKMAIL_API_BASE.rstrip("/")
-    headers = {"Authorization": f"Bearer {DUCKMAIL_BEARER}"}
-    session = _create_duckmail_session()
+    session = _create_mail_api_session()
 
     try:
         # 1. 创建账号
-        payload = {"address": email, "password": password}
-        res = session.post(
-            f"{api_base}/accounts",
-            json=payload,
-            headers=headers,
+        res = session.get(
+            _mail_api_url("/generate"),
+            params={"length": length},
+            headers=_mail_api_headers(),
             timeout=15,
             impersonate="chrome131"
         )
 
-        if res.status_code not in [200, 201]:
+        if res.status_code != 200:
             raise Exception(f"创建邮箱失败: {res.status_code} - {res.text[:200]}")
 
-        # 2. 获取 Token（用于读取邮件）
-        time.sleep(0.5)
-        token_payload = {"address": email, "password": password}
-        token_res = session.post(
-            f"{api_base}/token",
-            json=token_payload,
-            timeout=15,
-            impersonate="chrome131"
-        )
+        data = res.json()
+        email = data.get("email") or (data.get("data") or {}).get("email") or ""
+        if email:
+            return email, "N/A", email
 
-        if token_res.status_code == 200:
-            token_data = token_res.json()
-            mail_token = token_data.get("token")
-            if mail_token:
-                return email, password, mail_token
-
-        raise Exception(f"获取邮件 Token 失败: {token_res.status_code}")
+        raise Exception(f"创建邮箱响应缺少 email: {str(data)[:200]}")
 
     except Exception as e:
-        raise Exception(f"DuckMail 创建邮箱失败: {e}")
+        raise Exception(f"邮件 API 创建邮箱失败: {e}")
 
 
-def _fetch_emails_duckmail(mail_token: str):
-    """从 DuckMail 获取邮件列表"""
+def _fetch_emails_mail_api(mailbox_ref: str):
+    """按邮箱地址获取邮件列表"""
     try:
-        api_base = DUCKMAIL_API_BASE.rstrip("/")
-        headers = {"Authorization": f"Bearer {mail_token}"}
-        session = _create_duckmail_session()
+        session = _create_mail_api_session()
 
         res = session.get(
-            f"{api_base}/messages",
-            headers=headers,
+            _mail_api_url("/emails"),
+            params={"mailbox": mailbox_ref, "limit": 20},
+            headers=_mail_api_headers(),
             timeout=15,
             impersonate="chrome131"
         )
 
         if res.status_code == 200:
             data = res.json()
-            # DuckMail API 返回格式可能是 hydra:member 或 member
-            messages = data.get("hydra:member") or data.get("member") or data.get("data") or []
-            return messages
+            if isinstance(data, list):
+                return data
+            messages = data.get("data") or data.get("items") or []
+            return messages if isinstance(messages, list) else []
         return []
-    except Exception as e:
+    except Exception:
         return []
 
 
-def _fetch_email_detail_duckmail(mail_token: str, msg_id: str):
-    """获取 DuckMail 单封邮件详情"""
+def _fetch_email_detail_mail_api(mailbox_ref: str, msg_id: str):
+    """获取单封邮件详情"""
     try:
-        api_base = DUCKMAIL_API_BASE.rstrip("/")
-        headers = {"Authorization": f"Bearer {mail_token}"}
-        session = _create_duckmail_session()
+        session = _create_mail_api_session()
 
-        # 处理 msg_id 格式
-        if isinstance(msg_id, str) and msg_id.startswith("/messages/"):
-            msg_id = msg_id.split("/")[-1]
+        if isinstance(msg_id, str):
+            msg_id = msg_id.rsplit("/", 1)[-1]
 
         res = session.get(
-            f"{api_base}/messages/{msg_id}",
-            headers=headers,
+            _mail_api_url(f"/email/{msg_id}"),
+            headers=_mail_api_headers(),
             timeout=15,
             impersonate="chrome131"
         )
@@ -1191,25 +1323,47 @@ def _extract_verification_code(email_content: str):
     return None
 
 
-def wait_for_verification_email(mail_token: str, timeout: int = 120):
+def wait_for_verification_email(mailbox_ref: str, timeout: int = 120,
+                                not_before_ts: float = None, exclude_message_ids=None):
     """等待并提取 OpenAI 验证码"""
     start_time = time.time()
 
     while time.time() - start_time < timeout:
-        messages = _fetch_emails_duckmail(mail_token)
+        messages = _recent_mail_messages(
+            _fetch_emails_mail_api(mailbox_ref),
+            not_before_ts=not_before_ts,
+            exclude_message_ids=exclude_message_ids,
+        )
         if messages and len(messages) > 0:
-            # 获取最新邮件详情
-            first_msg = messages[0]
-            msg_id = first_msg.get("id") or first_msg.get("@id")
+            for msg in messages[:12]:
+                code = str(msg.get("verification_code") or "").strip()
+                if re.fullmatch(r"\d{6}", code) and code != "177010":
+                    return code
 
-            if msg_id:
-                detail = _fetch_email_detail_duckmail(mail_token, msg_id)
-                if detail:
-                    # DuckMail 的邮件内容在 text 或 html 字段
-                    content = detail.get("text") or detail.get("html") or ""
-                    code = _extract_verification_code(content)
-                    if code:
-                        return code
+                msg_id = msg.get("id") or msg.get("@id")
+                if not msg_id:
+                    continue
+
+                detail = _fetch_email_detail_mail_api(mailbox_ref, msg_id)
+                if not detail:
+                    continue
+
+                code = str(detail.get("verification_code") or "").strip()
+                if re.fullmatch(r"\d{6}", code) and code != "177010":
+                    return code
+
+                content = (
+                    detail.get("content")
+                    or detail.get("html_content")
+                    or detail.get("text")
+                    or detail.get("html")
+                    or detail.get("preview")
+                    or msg.get("preview")
+                    or ""
+                )
+                code = _extract_verification_code(content)
+                if code:
+                    return code
 
         time.sleep(3)
 
@@ -1306,104 +1460,85 @@ class ChatGPTRegister:
             )
         return data
 
-    # ==================== DuckMail 临时邮箱 ====================
+    # ==================== 邮件 API ====================
 
-    def _create_duckmail_session(self):
-        """创建带重试的 DuckMail 请求会话"""
+    def _create_mail_api_session(self):
+        """创建带重试的邮件 API 请求会话"""
         session = curl_requests.Session()
         session.headers.update({
             "User-Agent": self.ua,
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
-        return _enable_proxy_rotation(session, fallback_proxy=self.proxy, fixed_proxy=self.fixed_proxy)
+        if DUCKMAIL_USE_PROXY:
+            return _enable_proxy_rotation(session, fallback_proxy=self.proxy, fixed_proxy=self.fixed_proxy)
+        session.trust_env = False
+        return session
 
     def create_temp_email(self):
-        """创建 DuckMail 临时邮箱，返回 (email, password, mail_token)"""
+        """创建邮件地址，返回 (email, password, mailbox_ref)"""
         if not DUCKMAIL_BEARER:
-            raise Exception("DUCKMAIL_BEARER 未设置，无法创建临时邮箱")
+            raise Exception("duckmail_bearer(JWT_TOKEN) 未设置，无法创建临时邮箱")
 
-        # 生成随机邮箱前缀 8-13 位
-        chars = string.ascii_lowercase + string.digits
         length = random.randint(8, 13)
-        email_local = "".join(random.choice(chars) for _ in range(length))
-        email = f"{email_local}@duckmail.sbs"
-        password = _generate_password()
-
-        api_base = DUCKMAIL_API_BASE.rstrip("/")
-        headers = {"Authorization": f"Bearer {DUCKMAIL_BEARER}"}
-        session = self._create_duckmail_session()
+        session = self._create_mail_api_session()
 
         try:
-            # 1. 创建账号
-            payload = {"address": email, "password": password}
-            res = session.post(
-                f"{api_base}/accounts",
-                json=payload,
-                headers=headers,
+            res = session.get(
+                _mail_api_url("/generate"),
+                params={"length": length},
+                headers=_mail_api_headers(),
                 timeout=15,
                 impersonate=self.impersonate
             )
 
-            if res.status_code not in [200, 201]:
+            if res.status_code != 200:
                 raise Exception(f"创建邮箱失败: {res.status_code} - {res.text[:200]}")
 
-            # 2. 获取 Token（用于读取邮件）
-            time.sleep(0.5)
-            token_payload = {"address": email, "password": password}
-            token_res = session.post(
-                f"{api_base}/token",
-                json=token_payload,
-                timeout=15,
-                impersonate=self.impersonate
-            )
+            data = res.json()
+            email = data.get("email") or (data.get("data") or {}).get("email") or ""
+            if email:
+                return email, "N/A", email
 
-            if token_res.status_code == 200:
-                token_data = token_res.json()
-                mail_token = token_data.get("token")
-                if mail_token:
-                    return email, password, mail_token
-
-            raise Exception(f"获取邮件 Token 失败: {token_res.status_code}")
+            raise Exception(f"创建邮箱响应缺少 email: {str(data)[:200]}")
 
         except Exception as e:
-            raise Exception(f"DuckMail 创建邮箱失败: {e}")
+            raise Exception(f"邮件 API 创建邮箱失败: {e}")
 
-    def _fetch_emails_duckmail(self, mail_token: str):
-        """从 DuckMail 获取邮件列表"""
+    def _fetch_emails_mail_api(self, mailbox_ref: str):
+        """按邮箱地址获取邮件列表"""
         try:
-            api_base = DUCKMAIL_API_BASE.rstrip("/")
-            headers = {"Authorization": f"Bearer {mail_token}"}
-            session = self._create_duckmail_session()
+            session = self._create_mail_api_session()
 
             res = session.get(
-                f"{api_base}/messages",
-                headers=headers,
+                _mail_api_url("/emails"),
+                params={"mailbox": mailbox_ref, "limit": 20},
+                headers=_mail_api_headers(),
                 timeout=15,
                 impersonate=self.impersonate
             )
 
             if res.status_code == 200:
                 data = res.json()
-                messages = data.get("hydra:member") or data.get("member") or data.get("data") or []
-                return messages
+                if isinstance(data, list):
+                    return data
+                messages = data.get("data") or data.get("items") or []
+                return messages if isinstance(messages, list) else []
             return []
         except Exception:
             return []
 
-    def _fetch_email_detail_duckmail(self, mail_token: str, msg_id: str):
-        """获取 DuckMail 单封邮件详情"""
+    def _fetch_email_detail_mail_api(self, mailbox_ref: str, msg_id: str):
+        """获取单封邮件详情"""
         try:
-            api_base = DUCKMAIL_API_BASE.rstrip("/")
-            headers = {"Authorization": f"Bearer {mail_token}"}
-            session = self._create_duckmail_session()
+            session = self._create_mail_api_session()
 
-            if isinstance(msg_id, str) and msg_id.startswith("/messages/"):
-                msg_id = msg_id.split("/")[-1]
+            if isinstance(msg_id, str):
+                msg_id = msg_id.rsplit("/", 1)[-1]
 
             res = session.get(
-                f"{api_base}/messages/{msg_id}",
-                headers=headers,
+                _mail_api_url(f"/email/{msg_id}"),
+                headers=_mail_api_headers(),
                 timeout=15,
                 impersonate=self.impersonate
             )
@@ -1436,25 +1571,51 @@ class ChatGPTRegister:
                 return code
         return None
 
-    def wait_for_verification_email(self, mail_token: str, timeout: int = 120):
+    def wait_for_verification_email(self, mailbox_ref: str, timeout: int = 120,
+                                    not_before_ts: float = None, exclude_message_ids=None):
         """等待并提取 OpenAI 验证码"""
         self._print(f"[OTP] 等待验证码邮件 (最多 {timeout}s)...")
         start_time = time.time()
 
         while time.time() - start_time < timeout:
-            messages = self._fetch_emails_duckmail(mail_token)
+            messages = _recent_mail_messages(
+                self._fetch_emails_mail_api(mailbox_ref),
+                not_before_ts=not_before_ts,
+                exclude_message_ids=exclude_message_ids,
+            )
             if messages and len(messages) > 0:
-                first_msg = messages[0]
-                msg_id = first_msg.get("id") or first_msg.get("@id")
+                for msg in messages[:12]:
+                    code = str(msg.get("verification_code") or "").strip()
+                    if re.fullmatch(r"\d{6}", code) and code != "177010":
+                        self._print(f"[OTP] 验证码: {code}")
+                        return code
 
-                if msg_id:
-                    detail = self._fetch_email_detail_duckmail(mail_token, msg_id)
-                    if detail:
-                        content = detail.get("text") or detail.get("html") or ""
-                        code = self._extract_verification_code(content)
-                        if code:
-                            self._print(f"[OTP] 验证码: {code}")
-                            return code
+                    msg_id = msg.get("id") or msg.get("@id")
+                    if not msg_id:
+                        continue
+
+                    detail = self._fetch_email_detail_mail_api(mailbox_ref, msg_id)
+                    if not detail:
+                        continue
+
+                    code = str(detail.get("verification_code") or "").strip()
+                    if re.fullmatch(r"\d{6}", code) and code != "177010":
+                        self._print(f"[OTP] 验证码: {code}")
+                        return code
+
+                    content = (
+                        detail.get("content")
+                        or detail.get("html_content")
+                        or detail.get("text")
+                        or detail.get("html")
+                        or detail.get("preview")
+                        or msg.get("preview")
+                        or ""
+                    )
+                    code = self._extract_verification_code(content)
+                    if code:
+                        self._print(f"[OTP] 验证码: {code}")
+                        return code
 
             elapsed = int(time.time() - start_time)
             self._print(f"[OTP] 等待中... ({elapsed}s/{timeout}s)")
@@ -1579,14 +1740,15 @@ class ChatGPTRegister:
 
     # ==================== 自动注册主流程 ====================
 
-    def run_register(self, email, password, name, birthdate, mail_token):
-        """使用 DuckMail 的注册流程"""
+    def run_register(self, email, password, name, birthdate, mailbox_ref):
+        """使用邮件 API 的注册流程"""
         self.visit_homepage()
         _random_delay(0.3, 0.8)
         csrf = self.get_csrf()
         _random_delay(0.2, 0.5)
         auth_url = self.signin(email, csrf)
         _random_delay(0.3, 0.8)
+        pre_authorize_message_ids = _mail_message_id_set(self._fetch_emails_mail_api(mailbox_ref))
 
         final_url = self.authorize(auth_url)
         final_path = urlparse(final_url).path
@@ -1595,6 +1757,8 @@ class ChatGPTRegister:
         self._print(f"Authorize → {final_path}")
 
         need_otp = False
+        otp_started_at = None
+        otp_seen_message_ids = set()
 
         if "create-account/password" in final_path:
             self._print("全新注册流程")
@@ -1604,12 +1768,16 @@ class ChatGPTRegister:
                 raise Exception(f"Register 失败 ({status}): {data}")
             # register 之后可能还需要 send_otp（全新注册流程中 OTP 不一定在 authorize 时发送）
             _random_delay(0.3, 0.8)
+            otp_seen_message_ids = _mail_message_id_set(self._fetch_emails_mail_api(mailbox_ref))
             self.send_otp()
             need_otp = True
+            otp_started_at = time.time()
         elif "email-verification" in final_path or "email-otp" in final_path:
             self._print("跳到 OTP 验证阶段 (authorize 已触发 OTP，不再重复发送)")
             # 不调用 send_otp()，因为 authorize 重定向到 email-verification 时服务器已发送 OTP
             need_otp = True
+            otp_started_at = time.time()
+            otp_seen_message_ids = pre_authorize_message_ids
         elif "about-you" in final_path:
             self._print("跳到填写信息阶段")
             _random_delay(0.5, 1.0)
@@ -1623,12 +1791,18 @@ class ChatGPTRegister:
         else:
             self._print(f"未知跳转: {final_url}")
             self.register(email, password)
+            otp_seen_message_ids = _mail_message_id_set(self._fetch_emails_mail_api(mailbox_ref))
             self.send_otp()
             need_otp = True
+            otp_started_at = time.time()
 
         if need_otp:
-            # 使用 DuckMail 等待验证码
-            otp_code = self.wait_for_verification_email(mail_token)
+            # 使用邮件 API 等待验证码
+            otp_code = self.wait_for_verification_email(
+                mailbox_ref,
+                not_before_ts=otp_started_at,
+                exclude_message_ids=otp_seen_message_ids,
+            )
             if not otp_code:
                 raise Exception("未能获取验证码")
 
@@ -1636,9 +1810,16 @@ class ChatGPTRegister:
             status, data = self.validate_otp(otp_code)
             if status != 200:
                 self._print("验证码失败，重试...")
+                otp_seen_message_ids = _mail_message_id_set(self._fetch_emails_mail_api(mailbox_ref))
                 self.send_otp()
+                otp_started_at = time.time()
                 _random_delay(1.0, 2.0)
-                otp_code = self.wait_for_verification_email(mail_token, timeout=60)
+                otp_code = self.wait_for_verification_email(
+                    mailbox_ref,
+                    timeout=60,
+                    not_before_ts=otp_started_at,
+                    exclude_message_ids=otp_seen_message_ids,
+                )
                 if not otp_code:
                     raise Exception("重试后仍未获取验证码")
                 _random_delay(0.3, 0.8)
@@ -1929,7 +2110,7 @@ class ChatGPTRegister:
 
         return None
 
-    def perform_codex_oauth_login_http(self, email: str, password: str, mail_token: str = None):
+    def perform_codex_oauth_login_http(self, email: str, password: str, mailbox_ref: str = None):
         self._print("[OAuth] 开始执行 Codex OAuth 纯协议流程...")
 
         # 兼容两种 domain 形式，确保 auth 域也带 oai-did
@@ -2134,30 +2315,65 @@ class ChatGPTRegister:
 
         if need_oauth_otp:
             self._print("[OAuth] 4/7 检测到邮箱 OTP 验证")
-            if not mail_token:
-                self._print("[OAuth] OAuth 阶段需要邮箱 OTP，但未提供 mail_token")
+            if not mailbox_ref:
+                self._print("[OAuth] OAuth 阶段需要邮箱 OTP，但未提供 mailbox_ref")
                 return None
 
             headers_otp = _oauth_json_headers(f"{OAUTH_ISSUER}/email-verification")
             tried_codes = set()
             otp_success = False
             otp_deadline = time.time() + 120
+            otp_not_before_ts = time.time()
 
             while time.time() < otp_deadline and not otp_success:
-                messages = self._fetch_emails_duckmail(mail_token) or []
+                messages = _recent_mail_messages(
+                    self._fetch_emails_mail_api(mailbox_ref) or [],
+                    not_before_ts=otp_not_before_ts,
+                )
                 candidate_codes = []
+                round_seen = set()
 
                 for msg in messages[:12]:
+                    code = str(msg.get("verification_code") or "").strip()
+                    if (
+                        re.fullmatch(r"\d{6}", code)
+                        and code != "177010"
+                        and code not in tried_codes
+                        and code not in round_seen
+                    ):
+                        candidate_codes.append(code)
+                        round_seen.add(code)
+
                     msg_id = msg.get("id") or msg.get("@id")
                     if not msg_id:
                         continue
-                    detail = self._fetch_email_detail_duckmail(mail_token, msg_id)
+                    detail = self._fetch_email_detail_mail_api(mailbox_ref, msg_id)
                     if not detail:
                         continue
-                    content = detail.get("text") or detail.get("html") or ""
-                    code = self._extract_verification_code(content)
-                    if code and code not in tried_codes:
+                    code = str(detail.get("verification_code") or "").strip()
+                    if (
+                        re.fullmatch(r"\d{6}", code)
+                        and code != "177010"
+                        and code not in tried_codes
+                        and code not in round_seen
+                    ):
                         candidate_codes.append(code)
+                        round_seen.add(code)
+                        continue
+
+                    content = (
+                        detail.get("content")
+                        or detail.get("html_content")
+                        or detail.get("text")
+                        or detail.get("html")
+                        or detail.get("preview")
+                        or msg.get("preview")
+                        or ""
+                    )
+                    code = self._extract_verification_code(content)
+                    if code and code not in tried_codes and code not in round_seen:
+                        candidate_codes.append(code)
+                        round_seen.add(code)
 
                 if not candidate_codes:
                     elapsed = int(120 - max(0, otp_deadline - time.time()))
@@ -2283,15 +2499,15 @@ class ChatGPTRegister:
 # ==================== 并发批量注册 ====================
 
 def _register_one(idx, total, proxy, output_file):
-    """单个注册任务 (在线程中运行) - 使用 DuckMail 临时邮箱"""
-    pool = _get_proxy_pool(fallback_proxy=proxy)
+    """单个注册任务 (在线程中运行) - 使用邮件 API 创建邮箱"""
+    pool = _get_proxy_pool(fallback_proxy=proxy) if PROXY_ENABLED else None
     last_error = "unknown error"
 
     for attempt in range(1, PROXY_RETRY_ATTEMPTS_PER_ACCOUNT + 1):
         if _stop_event.is_set():
             return False, None, "已手动停止"
         reg = None
-        current_proxy = pool.next_proxy()
+        current_proxy = pool.next_proxy() if pool else None
         proxy_label = current_proxy or "direct"
 
         try:
@@ -2304,9 +2520,9 @@ def _register_one(idx, total, proxy, output_file):
                 f"[Proxy] 尝试 {attempt}/{PROXY_RETRY_ATTEMPTS_PER_ACCOUNT}: {proxy_label}"
             )
 
-            # 1. 创建 DuckMail 临时邮箱
-            reg._print("[DuckMail] 创建临时邮箱...")
-            email, email_pwd, mail_token = reg.create_temp_email()
+            # 1. 创建邮件地址
+            reg._print("[MailAPI] 创建临时邮箱...")
+            email, email_pwd, mailbox_ref = reg.create_temp_email()
             tag = email.split("@")[0]
             reg.tag = tag  # 更新 tag
 
@@ -2318,19 +2534,19 @@ def _register_one(idx, total, proxy, output_file):
                 print(f"\n{'='*60}")
                 print(f"  [{idx}/{total}] 注册: {email}")
                 print(f"  ChatGPT密码: {chatgpt_password}")
-                print(f"  邮箱密码: {email_pwd}")
+                print(f"  邮箱凭据: {email_pwd}")
                 print(f"  姓名: {name} | 生日: {birthdate}")
                 print(f"  代理: {proxy_label}")
                 print(f"{'='*60}")
 
             # 2. 执行注册流程
-            reg.run_register(email, chatgpt_password, name, birthdate, mail_token)
+            reg.run_register(email, chatgpt_password, name, birthdate, mailbox_ref)
 
             # 3. OAuth（可选）
             oauth_ok = True
             if ENABLE_OAUTH:
                 reg._print("[OAuth] 开始获取 Codex Token...")
-                tokens = reg.perform_codex_oauth_login_http(email, chatgpt_password, mail_token=mail_token)
+                tokens = reg.perform_codex_oauth_login_http(email, chatgpt_password, mailbox_ref=mailbox_ref)
                 oauth_ok = bool(tokens and tokens.get("access_token"))
                 if oauth_ok:
                     _save_codex_tokens(email, tokens)
@@ -2345,7 +2561,7 @@ def _register_one(idx, total, proxy, output_file):
                     reg._print(f"[OAuth] {msg}（按配置继续）")
 
             # 4. 成功后固定此代理（后续优先使用）
-            if current_proxy:
+            if current_proxy and pool:
                 pool.report_success(current_proxy)
                 _save_stable_proxy_to_file(current_proxy)
                 _save_stable_proxy_to_config(current_proxy)
@@ -2364,7 +2580,7 @@ def _register_one(idx, total, proxy, output_file):
 
         except Exception as e:
             last_error = str(e)
-            if current_proxy:
+            if current_proxy and pool:
                 pool.report_bad(current_proxy, error=e)
 
             with _print_lock:
@@ -2383,45 +2599,47 @@ def _register_one(idx, total, proxy, output_file):
 
 def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
               max_workers=3, proxy=None):
-    """并发批量注册 - DuckMail 临时邮箱版"""
+    """并发批量注册 - 邮件 API 版"""
 
     _stop_event.clear()
 
     if not DUCKMAIL_BEARER:
-        print("❌ 错误: 未设置 DUCKMAIL_BEARER 环境变量")
-        print("   请设置: export DUCKMAIL_BEARER='your_api_key_here'")
-        print("   或: set DUCKMAIL_BEARER=your_api_key_here (Windows)")
+        print("❌ 错误: 未设置 duckmail_bearer(JWT_TOKEN) 环境变量")
+        print("   请设置: export DUCKMAIL_BEARER='your_jwt_token'")
+        print("   或: set DUCKMAIL_BEARER=your_jwt_token (Windows)")
         return
-
-    pool = _get_proxy_pool(fallback_proxy=proxy)
-    pool.refresh(force=True)
-    proxy_info = pool.info()
 
     actual_workers = min(max_workers, total_accounts)
     print(f"\n{'#'*60}")
-    print(f"  ChatGPT 批量自动注册 (DuckMail 临时邮箱版)")
+    print(f"  ChatGPT 批量自动注册 (邮件 API 版)")
     print(f"  注册数量: {total_accounts} | 并发数: {actual_workers}")
-    print(f"  DuckMail: {DUCKMAIL_API_BASE}")
-    print(f"  代理源: {proxy_info['list_url']}")
-    print(f"  优先稳定代理: {'是' if proxy_info['prefer_stable_proxy'] else '否'}")
-    print(f"  账号级代理重试: {PROXY_RETRY_ATTEMPTS_PER_ACCOUNT} 次/账号")
-    print(f"  代理校验: {'开启' if proxy_info['validate_enabled'] else '关闭'}")
-    if proxy_info["validate_enabled"]:
-        print(f"  校验目标: {proxy_info['validate_test_url']}")
-        print(f"  校验超时: {proxy_info['validate_timeout_seconds']} 秒 | 校验并发: {proxy_info['validate_workers']}")
-        print(f"  校验通过: {proxy_info['validated_count']}/{proxy_info['fetched_count']}")
-    print(f"  代理池(HTTP/SOCKS): {proxy_info['count']} 个")
-    print(f"  代理重试: 单请求最多 {proxy_info['max_retries_per_request']} 次")
-    print(f"  失效冷却: {proxy_info['bad_ttl_seconds']} 秒")
-    if proxy_info["bad_count"] > 0:
-        print(f"  当前冷却代理: {proxy_info['bad_count']} 个")
-    if proxy_info["fallback_proxy"]:
-        print(f"  兜底代理: {proxy_info['fallback_proxy']}")
-    if proxy_info["stable_proxy"]:
-        print(f"  稳定代理: {proxy_info['stable_proxy']}")
-    print(f"  稳定代理文件: {_stable_proxy_path()}")
-    if proxy_info["last_error"]:
-        print(f"  代理拉取告警: {proxy_info['last_error'][:200]}")
+    print(f"  邮件 API: {DUCKMAIL_API_BASE}")
+    if PROXY_ENABLED:
+        pool = _get_proxy_pool(fallback_proxy=proxy)
+        pool.refresh(force=True)
+        proxy_info = pool.info()
+        print(f"  代理源: {proxy_info['list_url']}")
+        print(f"  优先稳定代理: {'是' if proxy_info['prefer_stable_proxy'] else '否'}")
+        print(f"  账号级代理重试: {PROXY_RETRY_ATTEMPTS_PER_ACCOUNT} 次/账号")
+        print(f"  代理校验: {'开启' if proxy_info['validate_enabled'] else '关闭'}")
+        if proxy_info["validate_enabled"]:
+            print(f"  校验目标: {proxy_info['validate_test_url']}")
+            print(f"  校验超时: {proxy_info['validate_timeout_seconds']} 秒 | 校验并发: {proxy_info['validate_workers']}")
+            print(f"  校验通过: {proxy_info['validated_count']}/{proxy_info['fetched_count']}")
+        print(f"  代理池(HTTP/SOCKS): {proxy_info['count']} 个")
+        print(f"  代理重试: 单请求最多 {proxy_info['max_retries_per_request']} 次")
+        print(f"  失效冷却: {proxy_info['bad_ttl_seconds']} 秒")
+        if proxy_info["bad_count"] > 0:
+            print(f"  当前冷却代理: {proxy_info['bad_count']} 个")
+        if proxy_info["fallback_proxy"]:
+            print(f"  兜底代理: {proxy_info['fallback_proxy']}")
+        if proxy_info["stable_proxy"]:
+            print(f"  稳定代理: {proxy_info['stable_proxy']}")
+        print(f"  稳定代理文件: {_stable_proxy_path()}")
+        if proxy_info["last_error"]:
+            print(f"  代理拉取告警: {proxy_info['last_error'][:200]}")
+    else:
+        print("  代理: 已关闭，当前以直连模式运行")
     print(f"  OAuth: {'开启' if ENABLE_OAUTH else '关闭'} | required: {'是' if OAUTH_REQUIRED else '否'}")
     if ENABLE_OAUTH:
         print(f"  OAuth Issuer: {OAUTH_ISSUER}")
@@ -2469,36 +2687,40 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
 
 def main():
     print("=" * 60)
-    print("  ChatGPT 批量自动注册工具 (DuckMail 临时邮箱版)")
+    print("  ChatGPT 批量自动注册工具 (邮件 API 版)")
     print("=" * 60)
 
-    # 检查 DuckMail 配置
+    # 检查邮件 API 配置
     if not DUCKMAIL_BEARER:
-        print("\n⚠️  警告: 未设置 DUCKMAIL_BEARER")
+        print("\n⚠️  警告: 未设置 duckmail_bearer(JWT_TOKEN)")
         print("   请编辑 config.json 设置 duckmail_bearer，或设置环境变量:")
-        print("   Windows: set DUCKMAIL_BEARER=your_api_key_here")
-        print("   Linux/Mac: export DUCKMAIL_BEARER='your_api_key_here'")
+        print("   Windows: set DUCKMAIL_BEARER=your_jwt_token")
+        print("   Linux/Mac: export DUCKMAIL_BEARER='your_jwt_token'")
         print("\n   按 Enter 继续尝试运行 (可能会失败)...")
         input()
 
-    env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
-             or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
-    default_fallback_proxy = _normalize_proxy(DEFAULT_PROXY)
-    env_fallback_proxy = _normalize_proxy(env_proxy)
-    proxy = default_fallback_proxy or env_fallback_proxy
-    proxy_source = "config.json(proxy)" if default_fallback_proxy else (
-        "环境变量(HTTPS_PROXY/ALL_PROXY)" if env_fallback_proxy else "未配置"
-    )
+    if PROXY_ENABLED:
+        env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
+                 or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+        default_fallback_proxy = _normalize_proxy(DEFAULT_PROXY)
+        env_fallback_proxy = _normalize_proxy(env_proxy)
+        proxy = default_fallback_proxy or env_fallback_proxy
+        proxy_source = "config.json(proxy)" if default_fallback_proxy else (
+            "环境变量(HTTPS_PROXY/ALL_PROXY)" if env_fallback_proxy else "未配置"
+        )
 
-    print(f"[Info] 代理池地址: {_normalize_proxy_list_url(PROXY_LIST_URL)}")
-    print("[Info] 代理模式: 自动拉取 US 列表，使用 http/socks 代理并轮询")
-    print(f"[Info] 代理校验: {'开启' if PROXY_VALIDATE_ENABLED else '关闭'} | 目标: {PROXY_VALIDATE_TEST_URL}")
-    print(f"[Info] 优先稳定代理开关: {'开启' if PREFER_STABLE_PROXY else '关闭'}")
-    print(f"[Info] 账号失败自动换代理重试: {PROXY_RETRY_ATTEMPTS_PER_ACCOUNT} 次")
-    if proxy:
-        print(f"[Info] 兜底代理来源: {proxy_source} -> {proxy}")
+        print(f"[Info] 代理池地址: {_normalize_proxy_list_url(PROXY_LIST_URL)}")
+        print("[Info] 代理模式: 自动拉取 US 列表，使用 http/socks 代理并轮询")
+        print(f"[Info] 代理校验: {'开启' if PROXY_VALIDATE_ENABLED else '关闭'} | 目标: {PROXY_VALIDATE_TEST_URL}")
+        print(f"[Info] 优先稳定代理开关: {'开启' if PREFER_STABLE_PROXY else '关闭'}")
+        print(f"[Info] 账号失败自动换代理重试: {PROXY_RETRY_ATTEMPTS_PER_ACCOUNT} 次")
+        if proxy:
+            print(f"[Info] 兜底代理来源: {proxy_source} -> {proxy}")
+        else:
+            print("[Info] 未配置兜底代理，远端列表为空时将直连")
     else:
-        print("[Info] 未配置兜底代理，远端列表为空时将直连")
+        proxy = None
+        print("[Info] 代理模式: 已关闭，忽略 config 与环境变量代理")
 
     # 输入注册数量
     count_input = input(f"\n注册账号数量 (默认 {DEFAULT_TOTAL_ACCOUNTS}): ").strip()

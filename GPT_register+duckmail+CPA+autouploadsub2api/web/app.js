@@ -79,7 +79,9 @@ document.addEventListener('DOMContentLoaded', () => {
     sub2apiAccountPageSize: $('sub2apiAccountPageSize'),
     // Config
     duckmailApiBase: $('duckmailApiBase'), duckmailBearer: $('duckmailBearer'),
+    duckmailUseProxy: $('duckmailUseProxy'),
     duckmailSaveBtn: $('duckmailSaveBtn'), duckmailStatus: $('duckmailStatus'),
+    proxyEnabled: $('proxyEnabled'), proxyListEnabled: $('proxyListEnabled'),
     proxyListUrl: $('proxyListUrl'),
     proxyInput: $('proxyInput'), stableProxyInput: $('stableProxyInput'),
     proxyValidateTimeout: $('proxyValidateTimeout'), proxyValidateWorkers: $('proxyValidateWorkers'),
@@ -794,6 +796,9 @@ async function loadConfig() {
     const res = await fetch('/api/config');
     const cfg = await res.json();
     if (DOM.duckmailApiBase) DOM.duckmailApiBase.value = cfg.duckmail_api_base || '';
+    if (DOM.duckmailUseProxy) DOM.duckmailUseProxy.checked = cfg.duckmail_use_proxy === true;
+    if (DOM.proxyEnabled) DOM.proxyEnabled.checked = cfg.proxy_enabled !== false;
+    if (DOM.proxyListEnabled) DOM.proxyListEnabled.checked = cfg.proxy_list_enabled === true;
     if (DOM.proxyListUrl) DOM.proxyListUrl.value = cfg.proxy_list_url || '';
     if (DOM.proxyInput) DOM.proxyInput.value = cfg.proxy || '';
     if (DOM.stableProxyInput) DOM.stableProxyInput.value = cfg.stable_proxy || '';
@@ -816,7 +821,10 @@ async function loadConfig() {
 async function saveDuckmailConfig() {
   DOM.duckmailSaveBtn.disabled = true;
   try {
-    const body = { duckmail_api_base: DOM.duckmailApiBase?.value.trim() || '' };
+    const body = {
+      duckmail_api_base: DOM.duckmailApiBase?.value.trim() || '',
+      duckmail_use_proxy: DOM.duckmailUseProxy?.checked === true,
+    };
     const bearer = DOM.duckmailBearer?.value.trim();
     if (bearer) body.duckmail_bearer = bearer;
     const res = await fetch('/api/config', {
@@ -824,7 +832,7 @@ async function saveDuckmailConfig() {
       body: JSON.stringify(body),
     });
     if (res.ok) {
-      showToast('DuckMail 配置已保存', 'success');
+      showToast('邮件 API 配置已保存', 'success');
       if (DOM.duckmailStatus) DOM.duckmailStatus.textContent = '已保存';
       if (DOM.duckmailBearer) DOM.duckmailBearer.value = '';
     } else {
@@ -838,6 +846,8 @@ async function saveProxyConfig() {
   DOM.proxySaveBtn.disabled = true;
   try {
     const body = {
+      proxy_enabled: DOM.proxyEnabled?.checked !== false,
+      proxy_list_enabled: DOM.proxyListEnabled?.checked === true,
       proxy_list_url: DOM.proxyListUrl?.value.trim() || '',
       proxy: DOM.proxyInput?.value.trim() || '',
       stable_proxy: DOM.stableProxyInput?.value.trim() || '',

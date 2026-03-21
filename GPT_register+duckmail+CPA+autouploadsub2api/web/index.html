@@ -253,20 +253,29 @@
   <div id="tabConfig" class="tab-panel" role="tabpanel">
     <div class="config-page">
 
-      <!-- DuckMail 配置 -->
+      <!-- 邮件 API 配置 -->
       <div class="config-card collapsible open">
         <div class="collapsible-trigger">
-          <span>DuckMail 邮箱配置</span>
+          <span>邮件 API 配置</span>
           <span class="collapse-icon">▶</span>
         </div>
         <div class="collapsible-body">
           <div class="config-field">
             <label>API 地址</label>
-            <input type="text" id="duckmailApiBase" placeholder="https://api.duckmail.sbs" autocomplete="off" spellcheck="false" />
+            <input type="text" id="duckmailApiBase" placeholder="https://mail.joini.cloud" autocomplete="off" spellcheck="false" />
           </div>
           <div class="config-field">
-            <label>Bearer Token</label>
+            <label>JWT_TOKEN</label>
             <input type="password" id="duckmailBearer" placeholder="填写则更新，否则保留原值" autocomplete="off" />
+          </div>
+          <div style="display:flex;gap:16px;margin-top:6px;flex-wrap:wrap;">
+            <label class="ios-toggle-label" for="duckmailUseProxy">
+              <span class="ios-toggle ios-toggle-sm">
+                <input type="checkbox" id="duckmailUseProxy" />
+                <span class="toggle-track"></span>
+              </span>
+              <span>邮件 API 走代理</span>
+            </label>
           </div>
           <div class="config-actions">
             <button id="duckmailSaveBtn" class="btn btn-primary btn-sm">保存</button>
@@ -282,6 +291,22 @@
           <span class="collapse-icon">▶</span>
         </div>
         <div class="collapsible-body">
+          <div style="display:flex;gap:16px;margin-top:6px;flex-wrap:wrap;">
+            <label class="ios-toggle-label" for="proxyEnabled">
+              <span class="ios-toggle ios-toggle-sm">
+                <input type="checkbox" id="proxyEnabled" />
+                <span class="toggle-track"></span>
+              </span>
+              <span>启用 GPT 代理</span>
+            </label>
+            <label class="ios-toggle-label" for="proxyListEnabled">
+              <span class="ios-toggle ios-toggle-sm">
+                <input type="checkbox" id="proxyListEnabled" />
+                <span class="toggle-track"></span>
+              </span>
+              <span>启用代理列表</span>
+            </label>
+          </div>
           <div class="config-field">
             <label>代理列表 URL</label>
             <input type="text" id="proxyListUrl" placeholder="https://raw.githubusercontent.com/..." autocomplete="off" spellcheck="false" />
