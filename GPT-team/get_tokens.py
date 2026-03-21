@@ -286,17 +286,17 @@ def create_temp_email() -> Tuple[Optional[str], Optional[str]]:
     name = "".join(name_chars)
     chosen_domain = random.choice(TEMP_MAIL_EMAIL_DOMAINS)
     try:
-        resp = http_session.post(
-            f"https://{TEMP_MAIL_WORKER_DOMAIN}/admin/new_address",
-            json={"enablePrefix": True, "name": name, "domain": chosen_domain},
-            headers={"x-admin-auth": TEMP_MAIL_ADMIN_PASSWORD, "Content-Type": "application/json"},
+        resp = http_session.get(
+            f"https://{TEMP_MAIL_WORKER_DOMAIN}/api/generate",
+            headers={"X-Admin-Token": TEMP_MAIL_ADMIN_PASSWORD, "Content-Type": "application/json"},
             timeout=15,
             verify=False,
         )
+        print(resp.text)
         if resp.status_code == 200:
             data = resp.json()
-            email = data.get("address")
-            token = data.get("jwt")
+            email = data.get("email")
+            token = TEMP_MAIL_ADMIN_PASSWORD
             if email:
                 logger.info("创建临时邮箱成功: %s", email)
                 return str(email), str(token or "")
@@ -306,18 +306,18 @@ def create_temp_email() -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def fetch_emails_list(jwt_token: str) -> List[Dict[str, Any]]:
+def fetch_emails_list(email: str, jwt_token: str) -> List[Dict[str, Any]]:
     """拉取收件箱邮件列表"""
     try:
         resp = http_session.get(
-            f"https://{TEMP_MAIL_WORKER_DOMAIN}/api/mails",
-            params={"limit": 10, "offset": 0},
+            f"https://{TEMP_MAIL_WORKER_DOMAIN}/api/emails",
+            params={"mailbox": email, "limit": 10, "offset": 0},
             headers={"Authorization": f"Bearer {jwt_token}"},
             verify=False,
             timeout=30,
         )
         if resp.status_code == 200:
-            rows = resp.json().get("results", [])
+            rows = resp.json()
             return rows if isinstance(rows, list) else []
     except Exception:
         pass
@@ -328,6 +328,11 @@ def _extract_otp(content: str) -> Optional[str]:
     """从邮件原始内容提取6位验证码"""
     if not content:
         return None
+    # 优先匹配 "Your ChatGPT code is XXXXXX" 格式，提取6-10位数字
+    m = re.search(r"code is\s+(\d{6,10})\b", content, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # 备用方案：匹配原来的格式
     m = re.search(r"background-color:\s*#F3F3F3[^>]*>[\s\S]*?(\d{6})[\s\S]*?</p>", content)
     if m:
         return m.group(1)
@@ -338,19 +343,19 @@ def _extract_otp(content: str) -> Optional[str]:
     return None
 
 
-def wait_for_otp(jwt_token: str, timeout: int = 120) -> Optional[str]:
+def wait_for_otp(email: str, jwt_token: str, timeout: int = 120) -> Optional[str]:
     """轮询等待6位验证码"""
     seen_ids: set = set()
     start = time.time()
     while time.time() - start < timeout:
-        for item in fetch_emails_list(jwt_token):
+        for item in fetch_emails_list(email,jwt_token):
             if not isinstance(item, dict):
                 continue
             eid = item.get("id")
             if eid in seen_ids:
                 continue
             seen_ids.add(eid)
-            code = _extract_otp(str(item.get("raw") or ""))
+            code = _extract_otp(str(item.get("subject") or ""))
             if code:
                 logger.info("收到验证码: %s", code)
                 return code
@@ -540,7 +545,7 @@ class Registrar:
             return False
 
         logger.info("[注册] 等待验证码...")
-        code = wait_for_otp(jwt_token, timeout=120)
+        code = wait_for_otp(email,jwt_token, timeout=120)
         if not code:
             logger.warning("[注册] 未收到验证码")
             return False
@@ -710,10 +715,10 @@ def oauth_login(email: str, password: str, jwt_token: str, proxy: str = "") -> O
         start = time.time()
         got = False
         while time.time() - start < 120:
-            for item in fetch_emails_list(jwt_token):
+            for item in fetch_emails_list(email,jwt_token):
                 if not isinstance(item, dict):
                     continue
-                c = _extract_otp(str(item.get("raw") or ""))
+                c = _extract_otp(str(item.get("subject") or ""))
                 if c and c not in tried:
                     tried.add(c)
                     rv = session.post(
