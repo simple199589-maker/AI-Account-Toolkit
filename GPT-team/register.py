@@ -37,6 +37,7 @@ from mail_service import (
     fetch_emails_list as shared_fetch_emails_list,
     wait_for_otp as shared_wait_for_otp,
 )
+from sub2api_service import Sub2ApiConfig, Sub2ApiUploader, normalize_group_ids
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -45,7 +46,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ============================================================
 # 配置加载
 # ============================================================
-_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CONFIG_FILE = os.path.join(_BASE_DIR, "config.yaml")
 
 
 def _load_config() -> Dict[str, Any]:
@@ -64,6 +66,14 @@ def _as_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _resolve_local_path(path_value: Any, default_name: str) -> str:
+    """将输出路径解析到脚本所在目录。AI by zb"""
+    raw_path = str(path_value or default_name).strip() or default_name
+    if os.path.isabs(raw_path):
+        return raw_path
+    return os.path.join(_BASE_DIR, raw_path)
+
+
 _cfg = _load_config()
 
 TOTAL_ACCOUNTS: int = int(_cfg.get("total_accounts", 1))
@@ -74,7 +84,7 @@ MAIL_CONFIG = TempMailConfig(
     worker_domain=TEMP_MAIL_WORKER_DOMAIN,
     admin_password=TEMP_MAIL_ADMIN_PASSWORD,
 )
-RESULTS_FILE: str = _cfg.get("output", {}).get("results_file", "results.txt")
+RESULTS_FILE: str = _resolve_local_path(_cfg.get("output", {}).get("results_file", "results.txt"), "results.txt")
 _sub2api_cfg: Dict[str, Any] = _cfg.get("sub2api", {}) or {}
 SUB2API_BASE_URL: str = str(_sub2api_cfg.get("base_url", "") or "").strip().rstrip("/")
 SUB2API_BEARER: str = str(_sub2api_cfg.get("bearer", "") or "").strip()
@@ -82,14 +92,7 @@ SUB2API_EMAIL: str = str(_sub2api_cfg.get("email", "") or "").strip()
 SUB2API_PASSWORD: str = str(_sub2api_cfg.get("password", "") or "").strip()
 AUTO_UPLOAD_SUB2API: bool = _as_bool(_sub2api_cfg.get("auto_upload_sub2api", False))
 _raw_group_ids = _sub2api_cfg.get("group_ids", [2])
-if isinstance(_raw_group_ids, list):
-    SUB2API_GROUP_IDS: List[int] = [
-        int(x) for x in _raw_group_ids if str(x).strip().lstrip("-").isdigit()
-    ]
-elif str(_raw_group_ids).strip().lstrip("-").isdigit():
-    SUB2API_GROUP_IDS = [int(_raw_group_ids)]
-else:
-    SUB2API_GROUP_IDS = [2]
+SUB2API_GROUP_IDS: List[int] = normalize_group_ids(_raw_group_ids, default=[2])
 
 SUB2API_MODEL_MAPPING: Dict[str, str] = {
     "gpt-3.5-turbo": "gpt-3.5-turbo",
@@ -166,8 +169,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("get-tokens")
 _save_lock = threading.Lock()
-_sub2api_auth_lock = threading.Lock()
-_sub2api_bearer_holder = [SUB2API_BEARER]
 
 # ============================================================
 # HTTP 工具
@@ -219,6 +220,19 @@ def create_session(proxy: str = "") -> requests.Session:
 
 
 http_session = create_session()
+_sub2api_uploader = Sub2ApiUploader(
+    http_session,
+    Sub2ApiConfig(
+        base_url=SUB2API_BASE_URL,
+        bearer=SUB2API_BEARER,
+        email=SUB2API_EMAIL,
+        password=SUB2API_PASSWORD,
+        group_ids=SUB2API_GROUP_IDS,
+        client_id=OAUTH_CLIENT_ID,
+        model_mapping=SUB2API_MODEL_MAPPING,
+    ),
+    logger,
+)
 
 # ============================================================
 # PKCE
@@ -538,6 +552,13 @@ class Registrar:
     def step5_create_account(self, first_name: str, last_name: str, birthdate: str) -> bool:
         h = self._headers(f"{OPENAI_AUTH_BASE}/about-you")
         body = {"name": f"{first_name} {last_name}", "birthdate": birthdate}
+        sentinel = build_sentinel_token(
+            self.session,
+            self.device_id,
+            flow="oauth_create_account",
+        )
+        if sentinel:
+            h["openai-sentinel-token"] = sentinel
         try:
             r = self.session.post(
                 f"{OPENAI_AUTH_BASE}/api/accounts/create_account",
@@ -546,13 +567,29 @@ class Registrar:
             if r.status_code == 200:
                 return True
             if r.status_code == 403 and "sentinel" in r.text.lower():
-                h["openai-sentinel-token"] = SentinelTokenGenerator(self.device_id).generate_token()
+                retry_sentinel = build_sentinel_token(
+                    self.session,
+                    self.device_id,
+                    flow="oauth_create_account",
+                )
+                if retry_sentinel:
+                    h["openai-sentinel-token"] = retry_sentinel
                 rr = self.session.post(
                     f"{OPENAI_AUTH_BASE}/api/accounts/create_account",
                     json=body, headers=h, verify=False, timeout=30,
                 )
-                return rr.status_code in (200, 301, 302)
-            return r.status_code in (301, 302)
+                if rr.status_code in (200, 301, 302):
+                    return True
+                logger.warning(
+                    "step5 sentinel 重试失败: HTTP %s | %s",
+                    rr.status_code,
+                    rr.text[:500],
+                )
+                return False
+            if r.status_code in (301, 302):
+                return True
+            logger.warning("step5 失败: HTTP %s | %s", r.status_code, r.text[:500])
+            return False
         except Exception as e:
             logger.warning("step5 异常: %s", e)
             return False
@@ -656,125 +693,18 @@ def _decode_jwt_payload(token: str) -> Dict[str, Any]:
 
 
 def _sub2api_login() -> str:
-    """登录 Sub2Api 并返回 bearer token。AI by zb"""
-    if not SUB2API_BASE_URL or not SUB2API_EMAIL or not SUB2API_PASSWORD:
-        return ""
-    try:
-        resp = http_session.post(
-            f"{SUB2API_BASE_URL}/api/v1/auth/login",
-            json={"email": SUB2API_EMAIL, "password": SUB2API_PASSWORD},
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            timeout=15,
-            verify=False,
-        )
-        data = resp.json()
-        token = (
-            data.get("token")
-            or data.get("access_token")
-            or (data.get("data") or {}).get("token")
-            or (data.get("data") or {}).get("access_token")
-            or ""
-        )
-        return str(token).strip()
-    except Exception as e:
-        logger.warning("[Sub2Api] 登录失败: %s", e)
-        return ""
+    """共享 Sub2Api 登录入口。AI by zb"""
+    return _sub2api_uploader.login()
 
 
 def _build_sub2api_account_payload(email: str, tokens: Dict[str, Any]) -> Dict[str, Any]:
-    """构建与参考脚本完全对齐的 Sub2Api 上传 payload。AI by zb"""
-    access_token = str(tokens.get("access_token") or "")
-    refresh_token = str(tokens.get("refresh_token") or "")
-    id_token = str(tokens.get("id_token") or "")
-
-    at_payload = _decode_jwt_payload(access_token) if access_token else {}
-    at_auth = at_payload.get("https://api.openai.com/auth") or {}
-    chatgpt_account_id = at_auth.get("chatgpt_account_id", "") or tokens.get("account_id", "")
-    chatgpt_user_id = at_auth.get("chatgpt_user_id", "")
-    exp_timestamp = at_payload.get("exp", 0)
-    expires_at = exp_timestamp if isinstance(exp_timestamp, int) and exp_timestamp > 0 else int(time.time()) + 863999
-
-    it_payload = _decode_jwt_payload(id_token) if id_token else {}
-    it_auth = it_payload.get("https://api.openai.com/auth") or {}
-    organization_id = it_auth.get("organization_id", "")
-    if not organization_id:
-        orgs = it_auth.get("organizations") or []
-        if orgs:
-            organization_id = (orgs[0] or {}).get("id", "")
-
-    return {
-        "auto_pause_on_expired": True,
-        "concurrency": 10,
-        "credentials": {
-            "access_token": access_token,
-            "chatgpt_account_id": chatgpt_account_id,
-            "chatgpt_user_id": chatgpt_user_id,
-            "client_id": OAUTH_CLIENT_ID,
-            "expires_in": 863999,
-            "expires_at": expires_at,
-            "model_mapping": SUB2API_MODEL_MAPPING,
-            "organization_id": organization_id,
-            "refresh_token": refresh_token,
-        },
-        "extra": {
-            "email": email,
-            "openai_oauth_responses_websockets_v2_enabled": True,
-            "openai_oauth_responses_websockets_v2_mode": "off",
-        },
-        "group_ids": SUB2API_GROUP_IDS,
-        "name": email,
-        "notes": "",
-        "platform": "openai",
-        "priority": 1,
-        "type": "oauth",
-        "rate_multiplier": 1,
-    }
+    """共享 Sub2Api payload 构建入口。AI by zb"""
+    return _sub2api_uploader.build_account_payload(email, tokens)
 
 
 def _push_account_to_sub2api(email: str, tokens: Dict[str, Any]) -> bool:
-    """上传账号到 Sub2Api，401 时自动刷新 bearer 后重试。AI by zb"""
-    if not SUB2API_BASE_URL or not str(tokens.get("refresh_token") or "").strip():
-        return False
-
-    url = f"{SUB2API_BASE_URL}/api/v1/admin/accounts"
-    payload = _build_sub2api_account_payload(email, tokens)
-
-    def _do_request(bearer: str) -> Tuple[int, str]:
-        try:
-            resp = http_session.post(
-                url,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {bearer}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/plain, */*",
-                    "Referer": f"{SUB2API_BASE_URL}/admin/accounts",
-                },
-                timeout=20,
-                verify=False,
-            )
-            return resp.status_code, resp.text
-        except Exception as e:
-            return 0, str(e)
-
-    bearer = _sub2api_bearer_holder[0]
-    status, body = _do_request(bearer)
-
-    if status == 401 and SUB2API_EMAIL and SUB2API_PASSWORD:
-        with _sub2api_auth_lock:
-            if _sub2api_bearer_holder[0] == bearer:
-                new_token = _sub2api_login()
-                if new_token:
-                    _sub2api_bearer_holder[0] = new_token
-        bearer = _sub2api_bearer_holder[0]
-        status, body = _do_request(bearer)
-
-    ok = status in (200, 201)
-    if ok:
-        logger.info("[Sub2Api] 上传成功: %s | HTTP %s", email, status)
-    else:
-        logger.warning("[Sub2Api] 上传失败: %s | HTTP %s | %s", email, status, body[:500])
-    return ok
+    """共享 Sub2Api 上传入口。AI by zb"""
+    return _sub2api_uploader.push_account(email, tokens)
 
 
 def _exchange_code_for_token(code: str, code_verifier: str, proxy: str = "") -> Optional[Dict[str, Any]]:

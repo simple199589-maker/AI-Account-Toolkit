@@ -11,7 +11,7 @@ GPT-Team 是一个全自动协议注册工具，使用纯 HTTP 协议完成 Chat
 - ✅ 纯 HTTP 协议注册子号（无浏览器）
 - ✅ 母号自动登录获取 Token
 - ✅ 自动拉 Team 邀请
-- ✅ 自动 Codex OAuth 授权上传 CPA
+- ✅ 自动 Codex OAuth 授权上传 Sub2Api
 - ✅ 集成 Cloudflare Worker 临时邮箱（需自建）
 
 ## 使用方法

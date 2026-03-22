@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gpt-team-new.py
+gpt-team-xianyu.py
 ================
+使用咸鱼号登录并拉空间
 全新纯 HTTP 协议版本（无 Selenium / 无浏览器）
 - 注册：使用 ProtocolRegistrar 五步 HTTP 流程 + Sentinel Token
 - 母号登录：HTTP OAuth + PKCE，自动拉取 account_id / auth_token
@@ -36,6 +37,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import requests
 import urllib3
 import yaml
+from codex_login_tool import CodexLoginMode, CodexLoginTool
 from mail_service import (
     TempMailConfig,
     create_temp_email as shared_create_temp_email,
@@ -82,6 +84,7 @@ def _resolve_local_path(path_value: Any, default_name: str) -> str:
 
 
 _cfg = _load_config()
+CODEX_LOGIN_MODE = CodexLoginMode.GPT_TEAM_WORKSPACE
 
 # 账号总数
 TOTAL_ACCOUNTS: int = int(_cfg.get("total_accounts", 2))
@@ -98,6 +101,11 @@ MAIL_CONFIG = TempMailConfig(
 # 输出文件
 ACCOUNTS_FILE: str = _resolve_local_path(_cfg["output"].get("accounts_file", "accounts.txt"), "accounts.txt")
 INVITE_TRACKER_FILE: str = _resolve_local_path(_cfg["output"]["invite_tracker_file"], "invite_tracker.json")
+TEAM_SESSION_CACHE_FILE: str = _resolve_local_path(
+    _cfg["output"].get("team_session_cache_file", "team_session_cache.json"),
+    "team_session_cache.json",
+)
+INVITE_ONLY_TEST_EMAIL: str = "8eu4hijj@joini.cloud"
 
 # Sub2Api 配置
 _sub2api_cfg: Dict[str, Any] = _cfg.get("sub2api", {}) or {}
@@ -422,8 +430,8 @@ def wait_for_otp(email: str, jwt_token: str, timeout: int = 120) -> Optional[str
     )
 
 
-OTP_FALLBACK_SEND_DELAY_SECONDS = 8
 MAIL_TIMEZONE = dt.timezone(dt.timedelta(hours=8))
+OTP_FALLBACK_SEND_DELAY_SECONDS = 8
 
 
 def build_mail_item_identity(item: Dict[str, Any]) -> str:
@@ -1301,6 +1309,8 @@ def perform_http_oauth_login(
                             auth_code = _follow_and_extract_code(session, full_next, oauth_issuer)
             except Exception:
                 pass
+        else:
+            logger.info("[Codex] workspace/select 跳过：未从 auth-session 中提取到 workspace_id | email=%s", email)
 
     # 最终 fallback: 带重定向再跟一次
     if not auth_code:
@@ -1429,6 +1439,119 @@ def build_token_dict(email: str, tokens: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_team_session_lock = threading.Lock()
+
+
+def load_team_session_cache() -> Dict[str, Dict[str, Any]]:
+    """读取母号登录态缓存。AI by zb"""
+    if not os.path.exists(TEAM_SESSION_CACHE_FILE):
+        return {}
+    try:
+        with open(TEAM_SESSION_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        logger.warning("读取母号登录态缓存失败: %s", e)
+    return {}
+
+
+def save_team_session_cache(cache: Dict[str, Dict[str, Any]]) -> None:
+    """保存母号登录态缓存。AI by zb"""
+    try:
+        with open(TEAM_SESSION_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("保存母号登录态缓存失败: %s", e)
+
+
+def restore_team_session_state(team: Dict[str, Any]) -> bool:
+    """从本地缓存恢复母号登录态。AI by zb"""
+    team_email = str(team.get("email") or "").strip()
+    if not team_email:
+        return False
+
+    with _team_session_lock:
+        cache = load_team_session_cache()
+
+    cached = cache.get(team_email)
+    if not isinstance(cached, dict):
+        return False
+
+    auth_token = str(cached.get("auth_token") or "").strip()
+    account_id = str(cached.get("account_id") or "").strip()
+    if not auth_token or not account_id:
+        return False
+
+    team["auth_token"] = auth_token
+    team["account_id"] = account_id
+    if cached.get("session_updated_at"):
+        team["session_updated_at"] = str(cached.get("session_updated_at"))
+
+    logger.info(
+        "复用本地母号登录态 | team=%s | email=%s | updated_at=%s",
+        team.get("name", team_email),
+        team_email,
+        cached.get("session_updated_at", ""),
+    )
+    return True
+
+
+def persist_team_session_state(team: Dict[str, Any]) -> None:
+    """持久化当前母号登录态，便于下次复用。AI by zb"""
+    team_email = str(team.get("email") or "").strip()
+    auth_token = str(team.get("auth_token") or "").strip()
+    account_id = str(team.get("account_id") or "").strip()
+    if not team_email or not auth_token or not account_id:
+        return
+
+    session_updated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    payload = {
+        "name": str(team.get("name") or ""),
+        "email": team_email,
+        "auth_token": auth_token,
+        "account_id": account_id,
+        "session_updated_at": session_updated_at,
+    }
+
+    with _team_session_lock:
+        cache = load_team_session_cache()
+        cache[team_email] = payload
+        save_team_session_cache(cache)
+
+    team["session_updated_at"] = session_updated_at
+
+
+def prompt_for_email_otp(email: str, tag: str = "", timeout: int = 300) -> Optional[str]:
+    """等待手动输入母号邮箱验证码。AI by zb"""
+    prompt_tag = tag or email
+    deadline = time.time() + max(timeout, 30)
+
+    while time.time() < deadline:
+        remain = max(1, int(deadline - time.time()))
+        try:
+            raw = input(
+                f"\n[{prompt_tag}] 已向 {email} 发送邮箱验证码，请输入 6 位 code "
+                f"(剩余 {remain}s，直接回车取消): "
+            ).strip()
+        except EOFError:
+            logger.warning("  [%s] 当前环境无法读取手动输入 | email=%s", prompt_tag, email)
+            return None
+
+        if not raw:
+            logger.warning("  [%s] 未输入验证码，已取消本次母号登录 | email=%s", prompt_tag, email)
+            return None
+
+        code = _extract_otp_from_raw(raw)
+        if code:
+            return code
+
+        logger.warning("  [%s] 输入内容未识别到 6 位验证码，请重试", prompt_tag)
+
+    logger.warning("  [%s] 等待手动输入 OTP 超时 | email=%s", prompt_tag, email)
+    return None
+
+
 def extract_workspace_id(payload: Any) -> Optional[str]:
     """从多种返回结构中提取 workspace_id。AI by zb"""
     if payload is None:
@@ -1454,6 +1577,7 @@ def extract_workspace_id(payload: Any) -> Optional[str]:
 
     workspaces = payload.get("workspaces")
     if isinstance(workspaces, list):
+        # 团队邀请场景优先选 organization workspace，其次再回退 personal。
         preferred_items = [item for item in workspaces if isinstance(item, dict) and str(item.get("kind") or "").strip() == "organization"]
         fallback_items = [item for item in workspaces if isinstance(item, dict)]
         for item in preferred_items + fallback_items:
@@ -1819,41 +1943,52 @@ def chatgpt_http_login(
         if next_step == "password" and not password:
             logger.warning(f"  [{tag}] 当前流程需要密码登录，但未配置母号密码 | email=%s", email)
             return "", ""
-        if not cf_token:
-            logger.warning(f"  [{tag}] 无密码且无 cf_token，无法获取OTP | email=%s", email)
-            return "", ""
         logger.info(f"  [{tag}] OTP模式：依赖 email-verification 页面触发验证码邮件 | email=%s", email)
         page_type = "email_otp_verification"
         continue_url = f"{OPENAI_AUTH_BASE}/email-verification"
 
     # ── Step D（可选）：邮箱 OTP 验证 ──
     if page_type == "email_otp_verification" or "email-verification" in continue_url:
-        if not cf_token:
-            logger.warning(f"  [{tag}] 需要OTP但无cf_token | email=%s", email)
-            return "", ""
-        logger.info(f"  [{tag}] 等待OTP | email=%s", email)
+        if cf_token:
+            logger.info(f"  [{tag}] OTP 已发送，自动轮询邮箱验证码 | email=%s", email)
+        else:
+            logger.info(f"  [{tag}] OTP 已发送，等待手动输入验证码 | email=%s", email)
         h_v = build_auth_json_headers(
             referer=f"{OPENAI_AUTH_BASE}/email-verification",
             device_id=device_id,
             include_device_id=False,
         )
-        tried: set = set()
-        start = time.time()
         got_code = False
-        while time.time() - start < 120:
-            for item in fetch_emails_list(email, cf_token):
-                if not isinstance(item, dict):
-                    continue
-                c = _extract_otp_from_raw(str(item.get("subject") or ""))
-                if not c:
-                    c = _extract_otp_from_raw(
-                        str(item.get("raw") or item.get("content") or item.get("text") or "")
-                    )
-                if c and c not in tried:
-                    tried.add(c)
+        if cf_token:
+            verify_deadline = time.time() + 180
+            tried_codes: set = set()
+            baseline_mail_ids = snapshot_mail_identities(email, cf_token)
+            mail_trigger_time = dt.datetime.now(MAIL_TIMEZONE)
+            while time.time() < verify_deadline:
+                all_emails = fetch_emails_list(email, cf_token)
+                all_codes = []
+                for item in sort_mail_items_newest_first(all_emails):
+                    if not isinstance(item, dict):
+                        continue
+                    mail_time = parse_mail_item_time(item)
+                    is_new_by_time = bool(mail_time and mail_time > mail_trigger_time)
+                    identity = build_mail_item_identity(item)
+                    if identity and identity in baseline_mail_ids and not is_new_by_time:
+                        continue
+                    if mail_time and mail_time <= mail_trigger_time:
+                        continue
+                    c = extract_otp_from_mail_item(item)
+                    if c and c not in tried_codes:
+                        all_codes.append(c)
+
+                for otp_code in all_codes:
+                    tried_codes.add(otp_code)
                     rv = session.post(
                         f"{OPENAI_AUTH_BASE}/api/accounts/email-otp/validate",
-                        json={"code": c}, headers=h_v, verify=False, timeout=30,
+                        json={"code": otp_code},
+                        headers=h_v,
+                        verify=False,
+                        timeout=30,
                     )
                     if rv.status_code == 200:
                         try:
@@ -1863,12 +1998,40 @@ def chatgpt_http_login(
                         except Exception:
                             pass
                         got_code = True
-                        logger.info(f"  [{tag}] OTP验证成功: %s", c)
+                        logger.info(f"  [{tag}] OTP验证成功: %s", otp_code)
                         logger.info(f"  [{tag}] auth-session snapshots after otp: %s", summarize_auth_session_cookies(session))
                         break
-            if got_code:
-                break
-            time.sleep(3)
+                    logger.warning(f"  [{tag}] OTP验证失败: HTTP %s | %s", rv.status_code, rv.text[:200])
+                if got_code:
+                    break
+                time.sleep(2)
+        else:
+            verify_deadline = time.time() + 300
+            while time.time() < verify_deadline:
+                otp_code = prompt_for_email_otp(
+                    email=email,
+                    tag=tag,
+                    timeout=max(30, int(verify_deadline - time.time())),
+                )
+                if not otp_code:
+                    return "", ""
+
+                rv = session.post(
+                    f"{OPENAI_AUTH_BASE}/api/accounts/email-otp/validate",
+                    json={"code": otp_code}, headers=h_v, verify=False, timeout=30,
+                )
+                if rv.status_code == 200:
+                    try:
+                        d2 = rv.json()
+                        continue_url = str(d2.get("continue_url") or continue_url)
+                        page_type = str(((d2.get("page") or {}).get("type")) or "")
+                    except Exception:
+                        pass
+                    got_code = True
+                    logger.info(f"  [{tag}] OTP验证成功: %s", otp_code)
+                    logger.info(f"  [{tag}] auth-session snapshots after otp: %s", summarize_auth_session_cookies(session))
+                    break
+                logger.warning(f"  [{tag}] OTP验证失败: HTTP %s | %s", rv.status_code, rv.text[:200])
         if not got_code:
             logger.warning(f"  [{tag}] OTP超时 | email=%s", email)
             return "", ""
@@ -1928,7 +2091,7 @@ def chatgpt_http_login(
                     f"  [{tag}] auth-session keys=%s | workspaces_type=%s | workspaces_preview=%s",
                     list(auth_session_data.keys())[:20],
                     type(auth_session_data.get('workspaces')).__name__,
-                    str(auth_session_data.get('workspaces'))[:200],
+                    str(auth_session_data.get('workspaces')),
                 )
                 ws_id = extract_workspace_id(auth_session_data)
 
@@ -2023,7 +2186,7 @@ def refresh_team_session_http(team):
     通过纯 HTTP OAuth 登录母号（chatgpt.com OAuth），
     获取 account_id 和 auth_token 并写回 team 字典。
     - 有 password：走密码登录流程
-    - 无 password：直接走邮箱 OTP 登录流程（母号邮箱必须在自建 Worker 中）
+    - 无 password：直接走邮箱 OTP 登录流程（发送后手动输入邮箱验证码）
     """
     m_email = team.get("email", "")
     m_password = team.get("password", "")  # 可为空，无密码时走 OTP
@@ -2034,26 +2197,18 @@ def refresh_team_session_http(team):
     mode_str = "密码登录" if m_password else "无密码OTP登录"
     logger.info("🔄 HTTP 刷新母号 session [%s]: %s", mode_str, m_email)
 
-    # 与 get_tokens.py 共用同一套邮箱配置，母号 OTP 也直接按邮箱地址拉取。
-    mother_mail_token = str(TEMP_MAIL_ADMIN_PASSWORD or "").strip()
-    if mother_mail_token:
-        logger.info("母号邮箱收件使用 temp_mail 全局配置 | email=%s", m_email)
-    if not m_password and not mother_mail_token:
-        logger.error("无密码模式下无法使用 temp_mail 全局配置拉取 OTP | email=%s", m_email)
-        return False
-
 
     # 使用 chatgpt.com 专用登录函数
     access_token, org_id = chatgpt_http_login(
         email=m_email,
         password=m_password,
-        cf_token=mother_mail_token,
         tag=team.get("name", m_email),
     )
 
     if access_token and org_id:
         team["auth_token"] = f"Bearer {access_token}"
         team["account_id"] = org_id
+        persist_team_session_state(team)
         logger.info("✅ 母号 token 刷新成功 | account_id=%s | email=%s", org_id, m_email)
         return True
 
@@ -2072,7 +2227,27 @@ def load_invite_tracker():
     if os.path.exists(INVITE_TRACKER_FILE):
         try:
             with open(INVITE_TRACKER_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                tracker = json.load(f)
+                if isinstance(tracker, dict):
+                    teams = tracker.get("teams") or {}
+                    normalized = {"teams": {}}
+                    for team in TEAMS:
+                        normalized["teams"][team["email"]] = []
+                    for team_key, entries in teams.items():
+                        normalized_entries = []
+                        if isinstance(entries, list):
+                            for item in entries:
+                                if isinstance(item, str):
+                                    normalized_entries.append({"email": item, "status": "sent"})
+                                elif isinstance(item, dict):
+                                    entry_email = str(item.get("email") or "").strip()
+                                    if entry_email:
+                                        normalized_entries.append({
+                                            "email": entry_email,
+                                            "status": str(item.get("status") or "sent"),
+                                        })
+                        normalized["teams"][team_key] = normalized_entries
+                    return normalized
         except Exception as e:
             logger.warning("读取 invite tracker 失败: %s", e)
     return {"teams": {team["email"]: [] for team in TEAMS}}
@@ -2086,6 +2261,37 @@ def save_invite_tracker(tracker):
         logger.warning("保存 invite tracker 失败: %s", e)
 
 
+def _find_tracker_entry(entries, email: str) -> Optional[Dict[str, Any]]:
+    """按邮箱查找邀请跟踪项。AI by zb"""
+    target = str(email or "").strip().lower()
+    for item in entries or []:
+        if isinstance(item, dict) and str(item.get("email") or "").strip().lower() == target:
+            return item
+    return None
+
+
+def mark_invite_tracker_status(team_email: str, email: str, status: str) -> None:
+    """更新邀请跟踪状态。AI by zb"""
+    with _tracker_lock:
+        tracker = load_invite_tracker()
+        entries = tracker["teams"].setdefault(team_email, [])
+        item = _find_tracker_entry(entries, email)
+        if item:
+            item["status"] = status
+        else:
+            entries.append({"email": email, "status": status})
+        save_invite_tracker(tracker)
+
+
+def find_invite_tracker_team_key(email: str) -> str:
+    """根据子号邮箱查找对应的车头邮箱。AI by zb"""
+    tracker = load_invite_tracker()
+    for team_key, entries in (tracker.get("teams") or {}).items():
+        if _find_tracker_entry(entries, email):
+            return team_key
+    return ""
+
+
 def get_available_team(tracker):
     for team in TEAMS:
         invited = tracker["teams"].get(team["email"], [])
@@ -2097,14 +2303,15 @@ def get_available_team(tracker):
 def invite_to_team(email, team):
     """发送团队邀请，token 失效（401）时自动刷新后重试一次"""
     if not team.get("account_id") or not team.get("auth_token"):
+        restore_team_session_state(team)
+    if not team.get("account_id") or not team.get("auth_token"):
         if not refresh_team_session_http(team):
             logger.error("未能获取母号 session，跳过邀请: %s", email)
             return False
 
-    account_id = team["account_id"]  # 应为 UUID 格式
-    invite_url = f"https://chatgpt.com/backend-api/accounts/{account_id}/invites"
-
     for attempt in range(2):
+        account_id = team["account_id"]  # 应为 UUID 格式
+        invite_url = f"https://chatgpt.com/backend-api/accounts/{account_id}/invites"
         headers = {
             "accept": "*/*",
             "accept-language": "en-US,en;q=0.9",
@@ -2134,6 +2341,8 @@ def invite_to_team(email, team):
                 return True
             elif resp.status_code == 401 and attempt == 0:
                 logger.info("Token 已过期，刷新后重试...")
+                team.pop("auth_token", None)
+                team.pop("account_id", None)
                 if not refresh_team_session_http(team):
                     return False
                 continue
@@ -2149,9 +2358,11 @@ def auto_invite_to_team(email):
     """线程安全地选择可用车头并发送邀请"""
     with _tracker_lock:
         tracker = load_invite_tracker()
-        for team_key, emails in tracker["teams"].items():
-            if email in emails:
-                logger.info("⚠️ %s 已邀请，跳过", email)
+        logger.info("当前邀请跟踪状态: %s", tracker)
+        for team_key, entries in tracker["teams"].items():
+            item = _find_tracker_entry(entries, email)
+            if item:
+                logger.info("⚠️ %s 已记录邀请状态=%s，跳过重复发送", email, item.get("status", "sent"))
                 return False
         team = get_available_team(tracker)
         if not team:
@@ -2160,7 +2371,7 @@ def auto_invite_to_team(email):
         team_key = team["email"]
         if team_key not in tracker["teams"]:
             tracker["teams"][team_key] = []
-        tracker["teams"][team_key].append(email)
+        tracker["teams"][team_key].append({"email": email, "status": "pending"})
         save_invite_tracker(tracker)
 
     ok = invite_to_team(email, team)
@@ -2168,11 +2379,13 @@ def auto_invite_to_team(email):
         with _tracker_lock:
             tracker = load_invite_tracker()
             lst = tracker["teams"].get(team_key, [])
-            if email in lst:
-                lst.remove(email)
+            item = _find_tracker_entry(lst, email)
+            if item in lst:
+                lst.remove(item)
             save_invite_tracker(tracker)
     else:
         invited_count = len(tracker["teams"].get(team_key, []))
+        mark_invite_tracker_status(team_key, email, "sent")
         logger.info("车头状态: %s %d/%d", team.get("name"), invited_count, team.get("max_invites", 3))
     return ok
 
@@ -2239,49 +2452,38 @@ def register_one_account(proxy=""):
         logger.info("⏳ 等待邀请生效 (5s)...")
         time.sleep(5)
 
-    # 4. HTTP 登录获取 Codex token（最多重试 3 次）
-    logger.info("🔑 HTTP 登录获取 Codex token | email=%s", email)
-    tokens = None
-    for attempt in range(1, 4):
-        tokens = perform_http_oauth_login(
-            email=email,
-            password=password,
-            cf_token=jwt_token,
-            worker_domain=TEMP_MAIL_WORKER_DOMAIN,
-            oauth_issuer=OPENAI_AUTH_BASE,
-            oauth_client_id=OAUTH_CLIENT_ID,
-            oauth_redirect_uri=OAUTH_REDIRECT_URI,
-            proxy=proxy,
-        )
-        if tokens:
-            break
-        if attempt < 3:
-            logger.warning("⚠️ Codex 登录第 %d 次失败，5s 后重试... | email=%s", attempt, email)
-            time.sleep(5)
+    codex_result = CodexLoginTool.run_gpt_team_post_invite_flow(
+        mode=CODEX_LOGIN_MODE,
+        gpt_team_callable=perform_http_oauth_login,
+        email=email,
+        password=password,
+        cf_token=jwt_token,
+        worker_domain=TEMP_MAIL_WORKER_DOMAIN,
+        oauth_issuer=OPENAI_AUTH_BASE,
+        oauth_client_id=OAUTH_CLIENT_ID,
+        oauth_redirect_uri=OAUTH_REDIRECT_URI,
+        proxy=proxy,
+        logger=logger,
+        attempts=3,
+        retry_delay_seconds=5,
+        build_token_dict_callable=build_token_dict,
+        upload_callable=_push_account_to_sub2api if AUTO_UPLOAD_SUB2API and SUB2API_BASE_URL else None,
+        output_dir=_resolve_local_path("output_tokens", "output_tokens"),
+    )
 
-    if not tokens:
-        logger.warning("❌ Codex 登录失败（注册已成功）| email=%s", email)
+    if not codex_result.success or not codex_result.tokens:
+        if invited:
+            team_key = find_invite_tracker_team_key(email)
+            if team_key:
+                mark_invite_tracker_status(team_key, email, "sent")
+                logger.warning("⚠️ 邀请已发送，但尚未确认接受 | email=%s", email)
         return email, password, True
 
-    # 5. 上传到 Sub2Api（按 sub2api 开关）+ 保存本地
-    if AUTO_UPLOAD_SUB2API and SUB2API_BASE_URL and str((tokens or {}).get("refresh_token") or "").strip():
-        _push_account_to_sub2api(email, tokens or {})
-    else:
-        logger.info("⏭️ 跳过 Sub2Api 上传（auto_upload_sub2api=false 或配置缺失）| email=%s", email)
-
-    token_dict = build_token_dict(email, tokens)
-
-    local_dir = _resolve_local_path("output_tokens", "output_tokens")
-    os.makedirs(local_dir, exist_ok=True)
-    token_file = os.path.join(local_dir, f"{email}.json")
-    try:
-        with open(token_file, "w", encoding="utf-8") as f:
-            json.dump(token_dict, f, ensure_ascii=False, indent=2)
-        logger.info("📁 token 已保存本地: %s", token_file)
-    except Exception as e:
-        logger.warning("本地保存 token 失败: %s", e)
-
-    logger.info("🎉 完整流程成功: %s", email)
+    if invited:
+        team_key = find_invite_tracker_team_key(email)
+        if team_key:
+            mark_invite_tracker_status(team_key, email, "accepted")
+            logger.info("✅ 邀请接受状态已确认 | email=%s | team=%s", email, team_key)
     return email, password, True
 
 
@@ -2336,8 +2538,38 @@ def run_batch():
 
 
 # ============================================================
-# ⑲ 程序入口
+# ⑲ 仅邀请测试入口
+# ============================================================
+
+def run_invite_only_test(target_email: str = INVITE_ONLY_TEST_EMAIL) -> bool:
+    """直接邀请固定测试邮箱，不执行注册流程。AI by zb"""
+    if not TEAMS:
+        logger.error("未配置任何车头，无法执行邀请测试")
+        return False
+
+    team = TEAMS[0]
+    logger.info("=" * 60)
+    logger.info(
+        "开始仅邀请测试 | team=%s | mother=%s | target=%s",
+        team.get("name", "unknown"),
+        team.get("email", ""),
+        target_email,
+    )
+    logger.info("=" * 60)
+
+    ok = invite_to_team(target_email, team)
+    if ok:
+        logger.info("✅ 仅邀请测试成功 | target=%s", target_email)
+    else:
+        logger.warning("❌ 仅邀请测试失败 | target=%s", target_email)
+    return ok
+
+
+# ============================================================
+# ⑳ 程序入口
 # ============================================================
 
 if __name__ == "__main__":
+    if "--invite-only" in sys.argv:
+        sys.exit(0 if run_invite_only_test() else 1)
     run_batch()
