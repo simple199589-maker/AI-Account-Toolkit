@@ -36,6 +36,13 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import requests
 import urllib3
 import yaml
+from mail_service import (
+    TempMailConfig,
+    create_temp_email as shared_create_temp_email,
+    extract_otp as shared_extract_otp,
+    fetch_emails_list as shared_fetch_emails_list,
+    wait_for_otp as shared_wait_for_otp,
+)
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -64,6 +71,10 @@ TOTAL_ACCOUNTS: int = int(_cfg.get("total_accounts", 2))
 TEMP_MAIL_WORKER_DOMAIN: str = _cfg["temp_mail"]["worker_domain"]
 TEMP_MAIL_EMAIL_DOMAINS: List[str] = _cfg["temp_mail"]["email_domains"]
 TEMP_MAIL_ADMIN_PASSWORD: str = _cfg["temp_mail"]["admin_password"]
+MAIL_CONFIG = TempMailConfig(
+    worker_domain=TEMP_MAIL_WORKER_DOMAIN,
+    admin_password=TEMP_MAIL_ADMIN_PASSWORD,
+)
 
 # CLI Proxy API（CPA）配置
 CLI_PROXY_API_BASE: str = _cfg["cli_proxy"]["api_base"].rstrip("/")
@@ -312,222 +323,39 @@ def build_sentinel_token(
 
 
 # ============================================================
-# ⑧ 临时邮箱 API（自建 Cloudflare Worker 版）
+# ⑧ 临时邮箱 API（与 get_tokens.py 共用）
 # ============================================================
 
 def create_temp_email() -> Tuple[Optional[str], Optional[str]]:
-    """
-    调用自建邮箱 API 创建新地址。
-    返回 (email_address, jwt_token)，失败返回 (None, None)
-    """
-    name_len = random.randint(10, 14)
-    name_chars = list(random.choices(string.ascii_lowercase, k=name_len))
-    for _ in range(random.choice([1, 2])):
-        pos = random.randint(2, len(name_chars) - 1)
-        name_chars.insert(pos, random.choice(string.digits))
-    name = "".join(name_chars)
-    chosen_domain = random.choice(TEMP_MAIL_EMAIL_DOMAINS)
-
-    try:
-        resp = http_session.post(
-            f"https://{TEMP_MAIL_WORKER_DOMAIN}/admin/new_address",
-            json={"enablePrefix": True, "name": name, "domain": chosen_domain},
-            headers={"x-admin-auth": TEMP_MAIL_ADMIN_PASSWORD, "Content-Type": "application/json"},
-            timeout=15,
-            verify=False,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            email = data.get("address")
-            token = data.get("jwt")
-            if email:
-                logger.info("创建临时邮箱成功: %s", email)
-                return str(email), str(token or "")
-        logger.warning("创建临时邮箱失败: HTTP %s | %s", resp.status_code, resp.text[:200])
-    except Exception as e:
-        logger.warning("创建临时邮箱异常: %s", e)
-    return None, None
+    """共享临时邮箱创建入口。AI by zb"""
+    return shared_create_temp_email(http_session, MAIL_CONFIG, logger)
 
 
 def _get_jwt_for_address(email_address: str) -> str:
-    """
-    通过 admin API 为已有邮箱地址获取 JWT（母号用）。
-    地址已在 Worker 中存在，尝试多种方式获取 JWT。
-    """
-    if not email_address or "@" not in email_address:
-        return ""
-    try:
-        name, domain_part = email_address.split("@", 1)
-        admin_h = {"x-admin-auth": TEMP_MAIL_ADMIN_PASSWORD, "Content-Type": "application/json"}
-
-        # 方法1：new_address enablePrefix=False（地址不存在时创建并返回JWT）
-        resp = http_session.post(
-            f"https://{TEMP_MAIL_WORKER_DOMAIN}/admin/new_address",
-            headers=admin_h,
-            json={"enablePrefix": False, "name": name, "domain": domain_part},
-            timeout=15, verify=False,
-        )
-        logger.info("_get_jwt 方法1: HTTP %s | body=%s", resp.status_code, resp.text[:120])
-        if resp.status_code in (200, 201):
-            data = resp.json()
-            jwt = data.get("jwt") or data.get("token")
-            if jwt:
-                return str(jwt)
-
-        # 地址已存在时（方法1返回400），通过列表API找到ID，然后请求生成 JWT
-        # cloudflare_temp_email 项目：name=完整邮箱, id=数字ID, 无JWT字段
-        found_id = None
-        search_done = False
-
-        # 方法A：先尝试带 search/q 参数的精确搜索（减少翻页量）
-        for search_key in ["q", "search", "query", "keyword", "name"]:
-            r_search = http_session.get(
-                f"https://{TEMP_MAIL_WORKER_DOMAIN}/admin/address",
-                params={"limit": 20, "offset": 0, search_key: email_address},
-                headers={"x-admin-auth": TEMP_MAIL_ADMIN_PASSWORD},
-                timeout=15, verify=False,
-            )
-            if r_search.status_code == 200:
-                s_items = r_search.json()
-                if isinstance(s_items, dict):
-                    s_items = s_items.get("results") or s_items.get("data") or []
-                if isinstance(s_items, list):
-                    for it in s_items:
-                        if str(it.get("name") or "").lower() == email_address.lower():
-                            found_id = it.get("id")
-                            logger.info("_get_jwt 搜索参数(%s)找到 | id=%s | email=%s",
-                                        search_key, found_id, email_address)
-                            search_done = True
-                            break
-            if search_done:
-                break
-
-        # 方法B：全量翻页搜索（遍历所有地址直到找到）
-        if not search_done:
-            page_size = 100
-            offset = 0
-            max_pages = 200  # 最多查 20000 个地址
-            first_page_logged = False
-            while not search_done and offset < page_size * max_pages:
-                resp_list = http_session.get(
-                    f"https://{TEMP_MAIL_WORKER_DOMAIN}/admin/address",
-                    params={"limit": page_size, "offset": offset},
-                    headers={"x-admin-auth": TEMP_MAIL_ADMIN_PASSWORD},
-                    timeout=15, verify=False,
-                )
-                if resp_list.status_code != 200:
-                    logger.info("_get_jwt 列表API: HTTP %s | body=%s",
-                                resp_list.status_code, resp_list.text[:80])
-                    break
-                raw_json = resp_list.json()
-                if not first_page_logged:
-                    first_page_logged = True
-                    logger.info("_get_jwt 全量搜索开始 | total首页: %s",
-                                str(raw_json.get("results", [])[:1])[:100] if isinstance(raw_json, dict) else "")
-                items = raw_json
-                if isinstance(items, dict):
-                    items = (items.get("results") or items.get("data")
-                             or items.get("addresses") or items.get("items") or [])
-                if not isinstance(items, list) or not items:
-                    logger.info("_get_jwt 全量搜索结束 | offset=%s (无更多条目)", offset)
-                    break
-                for it in items:
-                    if str(it.get("name") or "").lower() == email_address.lower():
-                        found_id = it.get("id")
-                        logger.info("_get_jwt 全量搜索找到 | id=%s | offset=%s | email=%s",
-                                    found_id, offset, email_address)
-                        search_done = True
-                        break
-                if search_done or len(items) < page_size:
-                    break
-                offset += page_size
-
-        if not search_done:
-            logger.warning("_get_jwt 未找到地址 | email=%s (已搜索至 offset=%s)", email_address, offset if 'offset' in dir() else 0)
-
-
-        if found_id:
-            # 使用 ID 调用 new_token 端点生成 JWT
-            for token_path in [
-                f"/admin/address/{found_id}/new_token",
-                f"/admin/new_address_token/{found_id}",
-                f"/admin/address/{found_id}/token",
-            ]:
-                resp_tok = http_session.post(
-                    f"https://{TEMP_MAIL_WORKER_DOMAIN}{token_path}",
-                    headers={"x-admin-auth": TEMP_MAIL_ADMIN_PASSWORD, "Content-Type": "application/json"},
-                    json={},
-                    timeout=15, verify=False,
-                )
-                logger.info("_get_jwt token端点 %s: HTTP %s | body=%s",
-                            token_path, resp_tok.status_code, resp_tok.text[:120])
-                if resp_tok.status_code in (200, 201):
-                    d = resp_tok.json()
-                    jwt = d.get("jwt") or d.get("token") or d.get("address_token")
-                    if jwt:
-                        logger.info("_get_jwt 通过ID端点成功 | email=%s", email_address)
-                        return str(jwt)
-
-        logger.warning("_get_jwt_for_address 全部方法失败 | email=%s", email_address)
-    except Exception as e:
-        logger.warning("_get_jwt_for_address 异常: %s | email=%s", e, email_address)
+    """旧 JWT 获取逻辑兼容保留，当前流程已不再使用。AI by zb"""
     return ""
 
 
-def fetch_emails_list(jwt_token: str) -> List[Dict[str, Any]]:
-    """拉取收件箱邮件列表"""
-    try:
-        resp = http_session.get(
-            f"https://{TEMP_MAIL_WORKER_DOMAIN}/api/mails",
-            params={"limit": 10, "offset": 0},
-            headers={"Authorization": f"Bearer {jwt_token}"},
-            verify=False,
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            rows = resp.json().get("results", [])
-            return rows if isinstance(rows, list) else []
-    except Exception:
-        pass
-    return []
+def fetch_emails_list(email: str, jwt_token: str) -> List[Dict[str, Any]]:
+    """共享收件列表入口。AI by zb"""
+    return shared_fetch_emails_list(http_session, MAIL_CONFIG, email, jwt_token)
 
 
 def _extract_otp_from_raw(content: str) -> Optional[str]:
-    """从邮件原始内容中提取6位数字验证码"""
-    if not content:
-        return None
-    # 优先提取 HTML 标签内的数字
-    m = re.search(r"background-color:\s*#F3F3F3[^>]*>[\s\S]*?(\d{6})[\s\S]*?</p>", content)
-    if m:
-        return m.group(1)
-    for pat in [r">\s*(\d{6})\s*<", r"(?<![#&])\b(\d{6})\b"]:
-        for code in re.findall(pat, content):
-            if code != "177010":
-                return code
-    return None
+    """共享 OTP 提取入口。AI by zb"""
+    return shared_extract_otp(content)
 
 
-def wait_for_otp(jwt_token: str, timeout: int = 120) -> Optional[str]:
-    """轮询等待并提取6位验证码"""
-    seen_ids: set = set()
-    start = time.time()
-    while time.time() - start < timeout:
-        emails = fetch_emails_list(jwt_token)
-        for item in emails:
-            if not isinstance(item, dict):
-                continue
-            eid = item.get("id")
-            if eid in seen_ids:
-                continue
-            seen_ids.add(eid)
-            raw = str(item.get("raw") or "")
-            code = _extract_otp_from_raw(raw)
-            if code:
-                logger.info("收到验证码: %s", code)
-                return code
-        time.sleep(3)
-    logger.warning("等待验证码超时（%ds）", timeout)
-    return None
+def wait_for_otp(email: str, jwt_token: str, timeout: int = 120) -> Optional[str]:
+    """共享 OTP 轮询入口。AI by zb"""
+    return shared_wait_for_otp(
+        http_session,
+        MAIL_CONFIG,
+        email,
+        jwt_token,
+        timeout=timeout,
+        logger=logger,
+    )
 
 
 # ============================================================
@@ -757,7 +585,7 @@ class ProtocolRegistrar:
             return False
 
         logger.info("[注册] 等待验证码 | email=%s", email)
-        code = wait_for_otp(jwt_token, timeout=120)
+        code = wait_for_otp(email, jwt_token, timeout=120)
         if not code:
             logger.warning("[注册] 未收到验证码 | email=%s", email)
             return False
@@ -956,7 +784,7 @@ def perform_http_oauth_login(
         start_time = time.time()
         code = None
         while time.time() - start_time < 120:
-            all_emails = fetch_emails_list(cf_token)
+            all_emails = fetch_emails_list(email, cf_token)
             if not all_emails:
                 time.sleep(2)
                 continue
@@ -964,7 +792,11 @@ def perform_http_oauth_login(
             all_codes = []
             for e_item in all_emails:
                 if isinstance(e_item, dict):
-                    c = _extract_otp_from_raw(str(e_item.get("raw") or ""))
+                    c = _extract_otp_from_raw(str(e_item.get("subject") or ""))
+                    if not c:
+                        c = _extract_otp_from_raw(
+                            str(e_item.get("raw") or e_item.get("content") or e_item.get("text") or "")
+                        )
                     if c and c not in tried_codes:
                         all_codes.append(c)
 
@@ -1678,10 +1510,14 @@ def chatgpt_http_login(
         start = time.time()
         got_code = False
         while time.time() - start < 120:
-            for item in fetch_emails_list(cf_token):
+            for item in fetch_emails_list(email, cf_token):
                 if not isinstance(item, dict):
                     continue
-                c = _extract_otp_from_raw(str(item.get("raw") or ""))
+                c = _extract_otp_from_raw(str(item.get("subject") or ""))
+                if not c:
+                    c = _extract_otp_from_raw(
+                        str(item.get("raw") or item.get("content") or item.get("text") or "")
+                    )
                 if c and c not in tried:
                     tried.add(c)
                     rv = session.post(
@@ -1866,16 +1702,12 @@ def refresh_team_session_http(team):
     mode_str = "密码登录" if m_password else "无密码OTP登录"
     logger.info("🔄 HTTP 刷新母号 session [%s]: %s", mode_str, m_email)
 
-    # 获取母号邮箱 JWT（用于 OTP 拉取）
-    # 优先使用 config.yaml 中直接配置的 jwt（最简单稳定）
-    mother_jwt = team.get("jwt", "").strip()
-    if not mother_jwt:
-        mother_jwt = _get_jwt_for_address(m_email)
-    if mother_jwt:
-        logger.info("母号邮箱 JWT 已获取 (%s) | email=%s",
-                    "config配置" if team.get("jwt") else "Worker API", m_email)
-    if not m_password and not mother_jwt:
-        logger.error("无密码模式下无法获取母号邮箱JWT | email=%s", m_email)
+    # 与 get_tokens.py 共用同一套邮箱配置，母号 OTP 也直接按邮箱地址拉取。
+    mother_mail_token = str(TEMP_MAIL_ADMIN_PASSWORD or "").strip()
+    if mother_mail_token:
+        logger.info("母号邮箱收件使用 temp_mail 全局配置 | email=%s", m_email)
+    if not m_password and not mother_mail_token:
+        logger.error("无密码模式下无法使用 temp_mail 全局配置拉取 OTP | email=%s", m_email)
         return False
 
 
@@ -1883,7 +1715,7 @@ def refresh_team_session_http(team):
     access_token, org_id = chatgpt_http_login(
         email=m_email,
         password=m_password,
-        cf_token=mother_jwt,
+        cf_token=mother_mail_token,
         tag=team.get("name", m_email),
     )
 

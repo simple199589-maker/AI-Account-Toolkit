@@ -26,17 +26,21 @@ GPT-Team 是一个全自动协议注册工具，使用纯 HTTP 协议完成 Chat
 
 ### 2. 配置文件
 
-编辑 `config.yaml` 文件，填入母号和临时邮箱信息：
+编辑 `config.yaml` 文件。`gpt-team-new.py` 与 `get_tokens.py` 共用同一个 `temp_mail` 配置，母号 OTP 也从这里接收：
 
 ```yaml
 total_accounts: 10              # 要创建的子号数量
-mother_account:                 # 母号（脚本自动登录）
-  email: "your@email.com"
-  password: "password"
 temp_mail:                      # CF Worker 临时邮箱配置
   worker_domain: "your-worker.workers.dev"
   email_domains: ["yourdomain.com"]
   admin_password: "your-admin-password"
+
+teams:                          # 母号配置
+  - name: "team-1"
+    email: "your@email.com"
+    password: "password"        # 可留空，留空时自动走邮箱 OTP
+    max_invites: 4
+
 proxy:                          # 代理（可选）
   http: "http://proxy:port"
 ```

@@ -1,0 +1,52 @@
+# 两个项目的精简合并配置模板
+# 目标：保留真实常用项，其他参数交给代码默认值
+
+total_accounts: 3
+
+mail:
+  provider: worker # worker | duckmail
+  base_url: "https://mail.joini.cloud"
+  domains:
+    - "joini.cloud"
+  admin_password: ""
+  bearer: ""
+
+proxy:
+  enabled: false
+  url: ""
+  pool_url: ""
+  validate: false
+  prefer_stable: true
+
+oauth:
+  enabled: true
+  required: true
+
+upload:
+  cpa:
+    enabled: true
+    api_base: ""
+    password: ""
+  sub2api:
+    enabled: false
+    base_url: ""
+    bearer: ""
+    email: ""
+    password: ""
+    group_ids:
+      - 3
+
+team:
+  invite_tracker_file: "invite_tracker.json"
+  mothers:
+    - name: "1"
+      email: ""
+      password: ""
+      jwt: ""
+      max_invites: 4
+
+output:
+  accounts_file: "accounts.txt"
+  results_file: "results.txt"
+  registered_file: "registered_accounts.txt"
+  token_dir: "codex_tokens"
