@@ -4,25 +4,38 @@
 
 # 注册账号总数
 total_accounts: 1
-
+proxy:                          # 代理（可选）
+  http: "127.0.0.1:7890"
 # ------------------------------------------------------------
 # 临时邮箱 API 配置
 # ------------------------------------------------------------
 temp_mail:
-  worker_domain: ""
+  worker_domain: "mail.joini.cloud"
   email_domains:
-    - "xxx.xyz"
-    - "xxx.eu.org"
-  admin_password: "xxxxxx"
+    - "joini.cloud"
+  admin_password: "jwtsdawfauhwfiolahifwhiaj2026"
 
 # ------------------------------------------------------------
-# CLI Proxy API (CPA) 配置
+# Sub2Api 配置
+# ------------------------------------------------------------
+sub2api:
+  base_url: "https://code.joini.cloud"
+  bearer: ""
+  email: "admin@sub2api.local"
+  password: "d7281f144d22954ba7e1bda91c2b8bdc"
+  auto_upload_sub2api: true
+  group_ids: [2]
+
+  
+# ------------------------------------------------------------
+# CLI Proxy API (CPA) 配置（旧版兼容，gpt-team-new.py 当前不再使用）
 # ------------------------------------------------------------
 cli_proxy:
   management_url: "http://xxx.comn:8317/management.html#/oauth"
   password: "xxxxxx"
   api_base: "http://xxx.comn:8317"
-  upload_enabled: true    # true=注册后自动上传到CPA | false=只保存本地
+  upload_enabled: true    # 旧版开关，当前 gpt-team-new.py 以上传到 sub2api 为准
+
 
 # ------------------------------------------------------------
 # 输出文件
@@ -37,14 +50,15 @@ output:
 # 车头（Team）配置
 # 只需填 email 和 max_invites，account_id/auth_token 自动获取
 # password 可不填 → 自动使用邮箱验证码登录
-# jwt: 母号在 email.xxx.xyz 里的 JWT Token（可选，填了就不需要API查询）
-#   获取方式：登录 https://email.xxx.xyz → 用母号邮箱登录 → 复制 Token
+# 当前版本默认使用 temp_mail.admin_password 按邮箱地址接收母号 OTP
+# jwt 字段已非必填，保留仅为兼容旧配置
 # ------------------------------------------------------------
 teams:
-  - name: "1"
-    email: "xxx@xxx.xyz"
-    password: "xxxxxx"
-    jwt: "eyJhbGxxxxxx"   # ← 填入母号在 email.856777.xyz 的 JWT 后，OTP 可自动接收
+  - name: "tp1"
+    # email: "58m2174s@joini.cloud"
+    email: "toayxianshen155@outlook.com"
+    password: ""
+    jwt: ""   # 可留空；当前默认使用 temp_mail 全局配置收 OTP
     max_invites: 4
 
 

@@ -20,8 +20,8 @@ import yaml
 from sub2api_service import Sub2ApiConfig, Sub2ApiUploader, normalize_group_ids
 
 
-TEST_EMAIL = "d2irfyp6@joini.cloud"
-TEST_PASSWORD = "!Tsm7i#CtCw5Qjsx"
+TEST_EMAIL = "ivy.gonzalez@joini.cloud"
+TEST_PASSWORD = "$%4Y8DUmDYsQ5Rpq"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.yaml")

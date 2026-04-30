@@ -1,0 +1,43 @@
+{
+  "api_id": 12345678,
+  "api_hash": "replace_with_your_api_hash",
+  "phone": "+8613800000000",
+  "session_name": "telegram_button_agent",
+  "bot_username": "your_bot_username",
+  "history_limit": 20,
+  "proxy": {
+    "enabled": false,
+    "proxy_type": "socks5",
+    "addr": "127.0.0.1",
+    "port": 7890,
+    "username": "",
+    "password": "",
+    "rdns": true
+  },
+  "startup_actions": [
+    {
+      "type": "message",
+      "text": "/start",
+      "delay_seconds": 1
+    },
+    {
+      "type": "button",
+      "text": "兑换卡密",
+      "delay_seconds": 2
+    }
+  ],
+  "message_rules": [
+    {
+      "keywords": [
+        "请发送卡密"
+      ],
+      "actions": [
+        {
+          "type": "prompt_reply",
+          "prompt": "机器人要求发送卡密，请输入本次卡密：",
+          "delay_seconds": 1
+        }
+      ]
+    }
+  ]
+}

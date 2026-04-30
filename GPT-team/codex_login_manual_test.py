@@ -20,8 +20,8 @@ import yaml
 from sub2api_service import Sub2ApiConfig, Sub2ApiUploader, normalize_group_ids
 
 
-TEST_EMAIL = "d2irfyp6@joini.cloud"
-TEST_PASSWORD = "!Tsm7i#CtCw5Qjsx"
+TEST_EMAIL = "zhujia88@codecoding.cc.cd"
+TEST_PASSWORD = "yGWjjqY7TvMl$BWF"
 OTP_FALLBACK_SEND_DELAY_SECONDS = 8
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -81,7 +81,8 @@ def upload_to_sub2api(module, email: str, tokens: Dict[str, Any], config: Dict[s
 
 def is_joini_cloud_email(email: str) -> bool:
     """判断是否为 joini.cloud 邮箱。AI by zb"""
-    return str(email or "").strip().lower().endswith("@joini.cloud")
+    return str(email or "").strip().lower().endswith("@codecoding.cc.cd")
+    # return str(email or "").strip().lower().endswith("@joini.cloud")
 
 
 def resolve_joini_cloud_otp_token(email: str, config: Optional[Dict[str, Any]] = None) -> str:

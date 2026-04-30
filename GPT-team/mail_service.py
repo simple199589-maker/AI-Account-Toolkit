@@ -35,6 +35,7 @@ def create_temp_email(
     try:
         resp = session.get(
             f"https://{config.worker_domain}/api/generate",
+            params={"mode": "human", "length": 16},
             headers={"X-Admin-Token": config.admin_password, "Content-Type": "application/json"},
             timeout=15,
             verify=False,

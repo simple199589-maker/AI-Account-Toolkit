@@ -2510,18 +2510,6 @@ def _register_one(idx, total, proxy, output_file):
         current_proxy = pool.next_proxy() if pool else None
         proxy_label = current_proxy or "direct"
 
-        if PROXY_ENABLED and not current_proxy:
-            last_error = "代理已启用，但当前没有可用代理 IP"
-            with _print_lock:
-                print(
-                    f"\n[FAIL] [{idx}] 尝试 {attempt}/{PROXY_RETRY_ATTEMPTS_PER_ACCOUNT} "
-                    f"失败: {last_error}"
-                )
-            if attempt >= PROXY_RETRY_ATTEMPTS_PER_ACCOUNT:
-                break
-            time.sleep(1)
-            continue
-
         try:
             reg = ChatGPTRegister(
                 proxy=current_proxy,
@@ -2650,15 +2638,6 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
         print(f"  稳定代理文件: {_stable_proxy_path()}")
         if proxy_info["last_error"]:
             print(f"  代理拉取告警: {proxy_info['last_error'][:200]}")
-        has_any_proxy = bool(
-            proxy_info["count"] > 0
-            or proxy_info["fallback_proxy"]
-            or proxy_info["stable_proxy"]
-        )
-        if not has_any_proxy:
-            print("  ❌ 当前未拿到任何可用代理，已阻止直连运行")
-            print(f"{'#'*60}\n")
-            return
     else:
         print("  代理: 已关闭，当前以直连模式运行")
     print(f"  OAuth: {'开启' if ENABLE_OAUTH else '关闭'} | required: {'是' if OAUTH_REQUIRED else '否'}")

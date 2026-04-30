@@ -1144,6 +1144,7 @@ def process_one(proxy: str = "") -> bool:
     password = generate_random_password()
     logger.info("=" * 50)
     logger.info("邮箱: %s", email)
+    logger.info("密码: %s", password)
 
     # 2. 注册
     reg = Registrar(proxy=proxy)

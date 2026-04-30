@@ -34,3 +34,6 @@ registered_accounts.csv
 invite_tracker.json
 stable_proxy.txt
 .issues
+telegram_button_automation/config.json
+telegram_button_automation/*.session
+telegram_button_automation/*.session-journal
